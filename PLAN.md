@@ -49,13 +49,31 @@ one official path that delivers originals: **Google Takeout → Google Drive →
   `title` (the original filename), `description`, `photoTakenTime`, `creationTime`,
   `geoData`, `geoDataExif`, `people`, `favorited`, `url`
   (`https://photos.google.com/photo/<id>`), `googlePhotosOrigin`.
-- **Known quirks** an ingester must handle: sidecar names are truncated to ~46 characters;
-  duplicate names become `IMG_1(1).jpg` with sidecar `IMG_1.jpg(1).json`; edited versions
-  are `IMG_1-edited.jpg` sharing the original's sidecar; on-disk names can be truncated or
-  de-duplicated while `title` holds the real name; an album folder and the matching media
-  may land in different parts of one export; Live Photos / motion photos arrive as
-  HEIC+MOV pairs or `.MP.jpg`; the same file appears once per album it is in, plus once in
-  its year folder.
+- **Known quirks** an ingester must handle, verified on 2026-10-06 against part 1 of the
+  real export (33,096 entries, 13,352 media, 19,744 sidecars, 26 year folders, 112 album
+  folders, all entries deflate-compressed, 314 non-ASCII names):
+  - duplicate names become `IMG_1(1).jpg`; the sidecar is
+    `IMG_1.jpg.supplemental-metadata(1).json` in current exports (the `(n)` moves to the
+    end of the sidecar name) and `IMG_1.jpg(1).json` in older ones; both styles are matched;
+  - sidecar names can be truncated to ~46 characters (none in part 1, still handled);
+  - edited versions are `IMG_1-edited.jpg` sharing the original's sidecar (445 in part 1);
+  - **splits across parts are the norm, not the exception**: in part 1, 7,336 sidecars
+    belong to media stored in another part and 295 media have their sidecar elsewhere; 69
+    of the 112 album folders have their `metadata.json` in another part;
+  - Pixel motion photos arrive as a pair, `PXL_x.MP` (the motion container, no sidecar of
+    its own) plus `PXL_x.MP.jpg` (the still, with sidecar); phone-side duplicates such as
+    `PXL_x.MP~2.jpg` keep their `~2`; iPhone Live Photos arrive as HEIC+MOV pairs;
+  - `Archive/` and `Trash/` are Google's special folders, not albums; albums can be named
+    like years (`2001`) and must not be confused with `Photos from 2001`;
+  - album folder names may carry trailing spaces (7 in part 1) and have apostrophes
+    replaced by `_`; `metadata.json` `title` holds the real title (`access`, `date`
+    present; `date` can be absent in newer exports);
+  - item sidecars carry `people`, `url` (the Google photo id) and `googlePhotosOrigin`;
+    `geoData` is all zeros when there is no location;
+  - extra JSON files to ignore: `shared_album_comments.json`,
+    `user-generated-memory-titles.json`, `print-subscriptions.json`, `archive_browser.html`;
+  - the same file appears once per album it is in, plus once in its year folder; the
+    largest single entry seen is a 1.7 GB video.
 - **Shared albums**: content other people added to a shared album is *not* in your export
   (it belongs to their account). Only your own contributions, and items you explicitly
   "saved" to your library, appear. The album folder itself does appear with `metadata.json`.
@@ -121,9 +139,9 @@ host                                   container (docker run --rm, weekly, exits
 │ gphoto-sync.service    │◄── exit ─── │   1. rclone lsjson <remote>  → new parts?        │
 │  (Type=exec)           │   code      │   2. rclone copyto <part> → /state/inbox         │
 │                        │             │   3. ingest zip → /data/<acct>/{library,albums}  │
-│ /srv/gphoto/data   ────┼── /data ──► │   4. SQLite bookkeeping, delete local part       │
-│ /srv/gphoto/state  ────┼── /state ─► │   5. next part, next account, report, exit       │
-│ /srv/gphoto/rclone ────┼─ /config ─► │  binaries: /usr/local/bin/{gphoto-sync,rclone}   │
+│ /home/leo/gphoto-backup/data   ────┼── /data ──► │   4. SQLite bookkeeping, delete local part       │
+│ /home/leo/gphoto-backup/state  ────┼── /state ─► │   5. next part, next account, report, exit       │
+│ /home/leo/gphoto-sync/config/rclone ────┼─ /config ─► │  binaries: /usr/local/bin/{gphoto-sync,rclone}   │
 └────────────────────────┘             └──────────────────────────────────────────────────┘
 ```
 
@@ -144,14 +162,18 @@ host                                   container (docker run --rm, weekly, exits
 1. **Discover**: `rclone lsjson --hash --files-only <remote>` where `<remote>` is the
    account's `rclone_remote` (for example `gdrive-leo:Takeout`). Each entry gives `ID` (Drive
    file id), `Name`, `Size`, `ModTime`, and `Hashes.MD5`. Keep files matching
-   `takeout-<timestamp>-<NNN>.zip`. The **Drive file id is the key** everywhere; the name is
+   `takeout-<timestamp>-<seq>-<NNN>.zip` (real example:
+   `takeout-20261006T035113Z-1-001.zip`). The **export id** is `<timestamp>-<seq>`
+   (`20261006T035113Z-1`); it is the key for parts, occurrences, pending sidecars,
+   completeness and album listings everywhere below and in the schema (`export_id`), and
+   exports are ordered by timestamp then sequence wherever "older" or "newer" is used. The **Drive file id is the key** everywhere; the name is
    only for display and for the local file. Drive allows two files with the same name in one
    folder: if the listing contains duplicate names, those parts are reported and neither is
    fetched or deleted until the duplicate is removed by hand. A Drive id already `ingested`
    in the `archives` table is skipped for ingest but, if `delete_remote_after_ingest` is on
    and `remote_deleted_at` is still NULL, its remote deletion is retried now (a failed
    deletion on an earlier run must not leave the part on Drive forever). A part in `partial`
-   state is fetched again and only its failed entries are retried. Group by the timestamp
+   state is fetched again and only its failed entries are retried. Group by export id
    (one export = N parts).
 2. **Settle**: Takeout uploads parts over several hours. Skip any part whose `ModTime` is
    younger than `settle` (default 2h); it is picked up by the next weekly run. Parts are
@@ -168,20 +190,33 @@ host                                   container (docker run --rm, weekly, exits
    is in memory, so entries are walked in a chosen order: `Photos from YYYY` folders first
    (library items), then album folders (mostly memberships), each group by offset. Classify each entry under `Takeout/Google Photos/`:
    - `*/metadata.json` → album descriptor (title, access, dates). `Photos from YYYY` folders
-     are year buckets, not albums.
+     are year buckets, not albums. `Archive/` and `Trash/` are Google's special folders:
+     Archive items are ingested into `library/` like any other and marked archived by
+     setting `items.archived_export_id` to the export that showed them there; a newer
+     export that shows the same item in a `Photos from YYYY` folder clears the mark
+     (the user unarchived it), and a newer `Archive/` occurrence sets it again, so the
+     flag always reflects the newest export that mentioned the item. Trash is skipped
+     unless `include_trash: true` (the user deleted those). Any other folder is an
+     album; if its `metadata.json` has not been seen yet (it usually sits in another part),
+     the album is created with the trimmed folder name as provisional title and updated
+     when the descriptor arrives.
    - `*.json` next to media → sidecar. Parse now; if its media occurrence is already
      known, attach it, else stash it in `pending_sidecars` keyed by (account, export,
      folder, normalized media name). The account is part of every key: two accounts
      exporting on the same day with the same filenames must never cross-match.
    - media → step 5.
    - anything else (`archive_browser.html`, `print-subscriptions.json`,
-     `user-generated-memory-titles.json`, …) → ignored but logged once.
+     `user-generated-memory-titles.json`, `shared_album_comments.json`, …) → ignored but
+     logged once.
    Entries already recorded for this part (resume after a crash) are skipped by name.
 5. **Ingest a media entry**:
    1. Stream to `/data/<account>/.tmp/<uuid>`, computing SHA-256 while writing.
-   2. Match the sidecar using the known naming variants (exact, `supplemental-metadata`,
-      truncated, `(n)` moved after the extension, `-edited` sharing the original's).
-   3. Resolve the **item identity**: `variant` is `edited` for `-edited` files, else
+   2. Match the sidecar using the known naming variants: `X.jpg.supplemental-metadata.json`,
+      `X.jpg.json`, truncated `X.jpg.supplemental-metadat.json`-style names, both `(n)`
+      styles (`X(1).jpg` ↔ `X.jpg.supplemental-metadata(1).json` or `X.jpg(1).json`),
+      `-edited` sharing the original's, and `PXL_x.MP` using the sidecar of `PXL_x.MP.jpg`.
+   3. Resolve the **item identity**: `variant` is `edited` for `-edited` files, `motion`
+      for a Pixel `PXL_x.MP` companion (identified through its `PXL_x.MP.jpg` still), else
       `original`. With a sidecar whose `url` carries a Google id the key is
       `<google id>#<variant>` (`identity_src = google_id`); the variant is part of the key
       because an edited file shares the original's sidecar and therefore its Google id,
@@ -203,14 +238,15 @@ host                                   container (docker run --rm, weekly, exits
       key, a `fallback` item may be **promoted** instead of creating a second item, but
       only on an unambiguous match (step 9).
       Without a usable sidecar the identity is **provisional and per occurrence**:
-      `occ:<export ts>#<folder>#<on-disk filename>` (`identity_src = fallback`). Two
+      `occ:<export id>#<folder>#<on-disk filename>` (`identity_src = fallback`). Two
       unresolved occurrences never share an item, so distinct photos that happen to have
       identical bytes and names cannot be collapsed before their sidecars say they are
       the same. There is no shortcut for album copies either: a sidecar-less
       album-folder occurrence gets its own provisional item (a hardlink to the blob, no
       extra bytes) and is merged into the right item only when its sidecar resolves it,
-      which in practice happens within the same part because Takeout writes a sidecar for
-      every file. Membership is never assigned on byte-and-name similarity alone.
+      which is often a later part: in the real part 1, 295 media had their sidecar in
+      another part, so promotion is a routine path, not an edge case. Membership is never
+      assigned on byte-and-name similarity alone.
       Provisional items that never resolve are listed in the report as "unresolved
       identity"; they are never lost, at worst the same photo has two library paths
       sharing one blob.
@@ -224,7 +260,10 @@ host                                   container (docker run --rm, weekly, exits
       QuickTime/MP4 creation time → `Photos from YYYY` folder year (month unknown → `YYYY/00`).
       Convert to the configured timezone for the `YYYY/MM` bucket.
    5. Filename: sidecar `title` (the real original name) sanitized for the filesystem,
-      falling back to the on-disk name.
+      falling back to the on-disk name. A `motion` companion keeps its **own** on-disk
+      name (`PXL_x.MP`): the still's sidecar supplies its identity and capture time, not
+      its name, so the motion bytes land next to the still as `PXL_x.MP`, never under the
+      still's `.jpg` name.
    6. Target `library/YYYY/MM/<name>` inside the account's subtree (paths are stored
       relative to `data_dir` and start with the account folder, so they are unique across
       accounts). If that path is already owned by a *different item
@@ -241,8 +280,15 @@ host                                   container (docker run --rm, weekly, exits
       per-item capture time is `items.taken_at` and the sidecar, not the mtime, and `verify`
       does not check mtimes. Write the sidecar next to the file as `<name>.json`; insert the
       `items` row (and the `blobs` row for a new blob).
-   8. Companion files (HEIC+MOV Live Photos, RAW+JPG, `.MP`) share the base name and land in
-      the same folder; the DB records the group.
+   8. Companion files share the base name and land in the same folder, and the DB records
+      the group: HEIC+MOV Live Photos, RAW+JPG, and Pixel motion photos. `PXL_x.MP` has
+      no sidecar of its own; it becomes its **own item** with variant `motion` under the
+      still's Google id (key `<id>#motion`, so it never collides with the still's
+      `<id>#original`), takes its capture time from the still's sidecar, and is tied to
+      the still through `group_id`. Album membership for any companion comes from its own
+      album-folder occurrences like every other item, plus the group rule in step 9: a
+      companion is also linked into every album its still is a direct member of, so a
+      motion file or a Live Photo video always follows its still into the album folder.
    9. **Late sidecars and promotion.** Within a part, a media entry whose sidecar has not
       been seen yet waits in `.tmp/` with its `occurrences` row in state `waiting`; when
       the part is finished, any still-unmatched media is ingested with the `fallback`
@@ -252,10 +298,17 @@ host                                   container (docker run --rm, weekly, exits
       has elapsed, orphan sidecars are reported and kept for diagnostics. **Matching a
       late sidecar to a fallback item is exact within an export**: the occurrence key
       (account, export, folder, entry name) identifies it, and the occurrence row names
-      the item it was ingested as. **Album membership is derived from occurrences, never
-      stored on its own**: an occurrence in an album folder carries `album_id`, and
-      `album_items(album, item)` exists exactly while at least one occurrence links that
-      pair (plus the `confirmed_at` bookkeeping for pruning). When an occurrence is
+      the item it was ingested as. **Album membership is derived, never stored on its own.** One `album_items` row per
+      `(album, item)` carries two independent source flags. `direct` is true exactly while
+      at least one active occurrence links that pair (with `confirmed_export_id` for
+      pruning). `via_group` is true exactly while the item shares a `group_id` with a
+      still that has `direct = true` in that album (`group_still` names it). The row, and
+      the hardlink, exist while either flag is true; a row with both flags false is
+      deleted. Each flag is recomputed on its own: `direct` whenever occurrences change
+      (ingest, re-attribution, prune), `via_group` whenever any `direct` flag in the group
+      changes, and both by `relink`. Pruning only ever clears `direct` on the still; the
+      companion's `via_group` follows, and its own `direct`, if it has one, is untouched,
+      so a companion with its own occurrence stays in the album after the still leaves. When an occurrence is
       re-pointed to another item, the derived link follows it, and the previous (album,
       item) link is dropped only if no other occurrence supports it. This is attribution
       correction, not pruning, and is allowed at any time. **Across exports**
@@ -383,20 +436,21 @@ across parts, so a complete listing is the **union of the album folders of all p
 that export**, and pruning is deferred until the export is *complete*. Part names carry no
 total, and a contiguous `-001`…`-N` proves nothing about `-N+1`, so completeness needs the
 **confirmed part count**: `exports.confirmed_parts`, set by
-`gphoto-sync exports confirm --account NAME --export TS --parts N` (the number Google shows
+`gphoto-sync exports confirm --account NAME --export ID --parts N` (the number Google shows
 on the Takeout "Manage your exports" page and in its completion e-mail) or by
 `ingest --full-albums --parts N`. An export is complete when `confirmed_parts` is set,
-every part `-001`…`-confirmed_parts` is `ingested`, and no further part with that timestamp
+every part `-001`…`-confirmed_parts` is `ingested`, and no further part of that export
 exists. When all parts seen are ingested and no new part has appeared for
 `export_complete_after` (default 7 days), the Telegram report says "export TS looks
 complete with N parts; confirm with …" as a nudge; without the confirmation nothing is ever
 pruned, which only delays the removal of stale album links, never loses data. If any part
-is `partial` or `ingested_with_errors`, the export never qualifies. Every `album_items` row records the timestamp of the export that last
-confirmed it. When a complete listing with timestamp T is applied, only memberships whose
-last confirmation is *older than T* and that are absent from the union are removed; anything
+is `partial` or `ingested_with_errors`, the export never qualifies. Every `album_items` row records the id of the export that last
+confirmed it. When a complete listing from export E is applied, only memberships whose
+last confirmation is from an export *older than E* (ordered by timestamp, then numeric
+sequence) and that are absent from the union are removed; anything
 confirmed by a later incremental export is untouched. Removing a
 membership marks every occurrence that supports that (album, item) pair and has
-`export_ts < T` as `active = 0`; memberships are derived from **active** occurrences only,
+an export id older than E as `active = 0`; memberships are derived from **active** occurrences only,
 and re-attribution (3.2 step 5.9) only ever moves active occurrences, so a pruned link can
 never be re-derived from history. A listing older than the newest
 already-applied complete listing for that album is never used for pruning. The `relink`
@@ -411,35 +465,38 @@ blobs        (id, sha256 UNIQUE, size, canonical_path, first_seen)   -- one row 
                                                                       -- canonical_path = an existing items.lib_path or
                                                                       -- item_versions.path, kept current by every journaled
                                                                       -- rename of that path (3.2 step 5.10)
-items        (id, account_id, blob_id, google_id, variant {original,edited}, identity_key,
+items        (id, account_id, blob_id, google_id, variant {original,edited,motion}, identity_key,
               identity_src {google_id,fallback}, filename, ext, mime, width, height,
-              taken_at, taken_src, lib_path UNIQUE, group_id, first_seen, last_seen,
+              taken_at, taken_src, lib_path UNIQUE, group_id, archived_export_id NULL,
+              first_seen, last_seen,
               UNIQUE(account_id, identity_key))   -- key = google_id#variant, else occ:export#folder#filename
                                                   -- lib_path, albums.path, link_path, canonical_path: all relative
                                                   -- to data_dir and prefixed with the account folder
 sidecars     (item_id, json BLOB, description, favorited, lat, lon, alt, people JSON)
 albums       (id, account_id, title, album_date, takeout_folder, kind {own,shared,partner},
               path UNIQUE, created, updated)      -- identity (account, title, album_date) or (account, takeout_folder)
-occurrences  (id, account_id, export_ts, part_no, folder, entry_name, variant, sha256,
+occurrences  (id, account_id, export_id, part_no, folder, entry_name, variant, sha256,
               album_id NULL, item_id NULL, state {waiting,ingested,resolved}, tmp_path,
               active)                            -- one row per media entry ever seen; memberships
                                                  -- are derived from active rows; prune deactivates
 fs_journal   (id, op {move,link,unlink,promote,supersede}, steps JSON, state {intent,done}, ts)
                                                  -- crash recovery for file operations, 3.2 step 5.11
-album_items  (album_id, item_id, link_path, confirmed_at, confirmed_by,
-              PRIMARY KEY(album_id, item_id))    -- derived from occurrences; confirmed_at = ts of the export
-item_versions (item_id, blob_id, path, superseded_at, by_export_ts)   -- kept files of re-edited items
-albums_full  (album_id, listing_ts)               -- newest complete listing applied per album
-archives     (account_id, remote_id UNIQUE, name, export_ts, part_no, size, md5, status
+album_items  (album_id, item_id, link_path, direct, confirmed_export_id, confirmed_by,
+              via_group, group_still NULL,       -- two independent sources, row lives while either is set
+              PRIMARY KEY(album_id, item_id))
+item_versions (item_id, blob_id, path, superseded_at, by_export_id)   -- kept files of re-edited items
+albums_full  (album_id, listing_export_id)        -- newest complete listing applied per album
+exports_order: export ids compare by timestamp, then numeric sequence; never as strings
+archives     (account_id, remote_id UNIQUE, name, export_id, part_no, size, md5, status
               {seen,fetching,ingesting,ingested,partial,ingested_with_errors,failed},
               local_path, remote_deleted_at, started, finished, entries, ingested,
               duplicates, errors)
 archive_entries (archive_id, entry_name, status {done,skipped,failed,given_up}, attempts,
               last_error)                        -- resume inside a part, retry failed entries
-exports      (account_id, export_ts, highest_part, confirmed_parts, last_part_seen_at,
+exports      (account_id, export_id, highest_part, confirmed_parts, last_part_seen_at,
               complete_at, authoritative, albums_pruned_at)   -- completeness + pruning rights, see 3.3
-pending_sidecars (account_id, export_ts, folder, media_key, json,
-              PRIMARY KEY(account_id, export_ts, folder, media_key))   -- sidecars seen before their media
+pending_sidecars (account_id, export_id, folder, media_key, json,
+              PRIMARY KEY(account_id, export_id, folder, media_key))   -- sidecars seen before their media
 runs         (account_id, started, finished, exit_code, counts JSON)
 errors       (ts, account_id, ref, message)
 telegram_chats (chat_id PRIMARY KEY, user_id, username, display_name, paired_at, revoked_at)
@@ -481,6 +538,8 @@ takeout:
   delete_remote_after_ingest: false   # turn on after the first full export is verified
   expected_interval: 720h          # 30 days; overdue after this + grace
   grace: 336h
+  include_trash: false             # Google's Trash/ folder: skipped by default
+  include_archive: true            # Google's Archive/ folder: ingested, flagged archived
   max_entry_attempts: 3            # runs before a failing entry is given up
   export_complete_after: 168h      # no new part for 7 days → report asks to confirm the part count
 telegram:
@@ -498,7 +557,7 @@ log:
 ```
 gphoto-sync sync [--account NAME] [--dry-run]              # all accounts by default: discover, fetch, ingest, report, exit
 gphoto-sync ingest --account NAME <dir|zip>... [--full-albums --parts N]   # local Takeout dump, no rclone
-gphoto-sync exports confirm --account NAME --export TS --parts N   # record the part count Google reports
+gphoto-sync exports confirm --account NAME --export ID --parts N   # record the part count Google reports
 gphoto-sync retry --account NAME [--part NAME]             # reset given-up entries so the next run retries them
 gphoto-sync check-remote [--account NAME]                  # list parts rclone can see and their state
 gphoto-sync status [--account NAME]                        # counts, last export seen, overdue flag
@@ -534,25 +593,35 @@ non-zero as a failed unit; the Telegram report carries the detail.
    - *SSH port forward*: run `rclone config` on the server, answer "no" to "use web
      browser", it prints a `http://127.0.0.1:53682/...` URL; from the laptop
      `ssh -L 53682:127.0.0.1:53682 server`, open the URL locally, sign in.
-   The server's `/srv/gphoto/rclone/rclone.conf` ends up with one `[section]` per account
+   The server's `/home/leo/gphoto-sync/config/rclone/rclone.conf` ends up with one `[section]` per account
    (sections can be concatenated by hand; the existing `[gdrive]` can be renamed to
    `[gdrive-leo]` by editing the header). Owned by the service UID, mode 0600. Treat it as a
    password: it holds every account's refresh token. Verify with
-   `rclone --config /srv/gphoto/rclone/rclone.conf lsd gdrive-jane:`.
+   `rclone --config /home/leo/gphoto-sync/config/rclone/rclone.conf lsd gdrive-jane:`.
 2. **One Takeout schedule per account**, created while signed in as that person at
    takeout.google.com (done for your account on 2026-10-05): Google Photos only, monthly for
    one year, incremental after the first export, destination that person's Drive, zip,
    50 GB parts. Each account's Drive needs room for its own full export. Renew after
    12 months; the overdue exit code (per account) is the reminder.
 3. **Telegram bot**: create it with @BotFather, save the token to
-   `/srv/gphoto/telegram.token` (service UID, mode 0600), then run
-   `docker run --rm -it <mounts> ghcr.io/<owner>/gphoto-sync telegram pair --people 2`.
+   `/home/leo/gphoto-sync/config/telegram.token` (service UID, mode 0600), then run
+   `docker run --rm -it <mounts> gphoto-sync:local telegram pair --people 2`.
    It prints one single-use code per person; each person opens a private chat with the bot
    and sends `/start <their code>`. `telegram test` confirms delivery.
-4. **Host directories** (x86-64 Linux with Docker Engine): `/srv/gphoto/data` (all
-   accounts' library + albums, one local filesystem), `/srv/gphoto/state` (DB, inbox;
-   needs ≥ 60 GB free), `/srv/gphoto/rclone`, `/srv/gphoto/telegram.token`,
-   `/srv/gphoto/config.yaml`.
+4. **Host** (checked 2026-10-06): `home-nvr`, `ssh leo@10.19.76.5`, Ubuntu 22.04 x86-64,
+   Docker 27.5 + Compose v2.23, user `leo` (uid/gid 1000, docker group, passwordless
+   sudo), ext4 root with ~270 GB free: enough for the 182 GB library plus 50 GB staging
+   of one account; the extra backup disk should arrive before the second account's full
+   export. Layout:
+   - `/home/leo/gphoto-sync` — git clone of this repo; the image is built here with
+     `docker build -t gphoto-sync:local .`; `config/` holds `config.yaml`,
+     `rclone/rclone.conf`, `telegram.token` and is excluded both by `.gitignore` and by
+     `.dockerignore`, so credentials never enter the build context or an image layer.
+   - `/home/leo/gphoto-backup/data` — all accounts' `library/` and `albums/`;
+     `/home/leo/gphoto-backup/state` — DB and inbox staging, kept next to the data so
+     both move together when the extra disk comes (DB paths are `data_dir`-relative);
+     `/home/leo/gphoto-backup/downloads` — manually downloaded parts for
+     `gphoto-sync ingest` (part 1 of the 2026-10-06 export is already there).
 5. **Install units** from 3.8, `systemctl enable --now gphoto-sync.timer`, and run the first
    pass by hand with `systemctl start gphoto-sync.service` while watching
    `journalctl -fu gphoto-sync` and the Telegram chat.
@@ -566,9 +635,12 @@ non-zero as a failed unit; the Telegram report carries the detail.
 via `modernc.org/sqlite`); the final stage is `gcr.io/distroless/static-debian12:nonroot`
 with `COPY --from=rclone/rclone:1.72 /usr/local/bin/rclone /usr/local/bin/rclone`. rclone is
 also a static Go binary and distroless static ships CA certificates, so nothing else is
-needed. Entrypoint `gphoto-sync`, default command `sync`. Built for amd64 (the target
-server; arm64 is a one-line addition if ever needed) via GitHub Actions; `go vet`,
-`staticcheck`, `go test -race`, `govulncheck` in CI.
+needed. Entrypoint `gphoto-sync`, default command `sync`. Built on the server itself
+with `docker build -t gphoto-sync:local .` (amd64; no registry needed). The repo ships a
+`.dockerignore` that excludes `config/`, `.git/`, and anything not needed for the build,
+and the Dockerfile copies only `go.mod`, `go.sum` and the source directories, never the
+whole tree; `go vet`,
+`staticcheck`, `go test -race`, `govulncheck` run in a `make check` target and, later, CI.
 
 **No daemon, no HTTP**: logs go to stdout/stderr as JSON; `docker run` without `-d` hands them
 to systemd, which puts them in the journal. SIGTERM finishes the current entry and exits;
@@ -576,11 +648,11 @@ nothing is ever half-written (temp file + rename). Memory during a run is bounde
 central directory of a 50 GB part is a few MB, media are streamed, rclone uses its own
 transfer buffers. Between runs nothing is resident.
 
-**Mounts** (`-v host:container`): `/srv/gphoto/data:/data`, `/srv/gphoto/state:/state`,
-`/srv/gphoto/rclone:/config/rclone` (read-write: rclone persists refreshed access tokens;
-read-only would work but log an error every run), `/srv/gphoto/config.yaml:/config/config.yaml:ro`,
-`/srv/gphoto/telegram.token:/config/telegram.token:ro`.
-`--user <uid>:<gid>` of the host user who owns `/srv/gphoto`, so files are not root-owned.
+**Mounts** (`-v host:container`): `/home/leo/gphoto-backup/data:/data`, `/home/leo/gphoto-backup/state:/state`,
+`/home/leo/gphoto-sync/config/rclone:/config/rclone` (read-write: rclone persists refreshed access tokens;
+read-only would work but log an error every run), `/home/leo/gphoto-sync/config/config.yaml:/config/config.yaml:ro`,
+`/home/leo/gphoto-sync/config/telegram.token:/config/telegram.token:ro`.
+`--user 1000:1000` (leo, who owns `/home/leo/gphoto-backup`), so files are not root-owned.
 
 **systemd**:
 
@@ -599,12 +671,12 @@ ExecStartPre=-/usr/bin/docker rm -f gphoto-sync
 ExecStart=/usr/bin/docker run --rm --name gphoto-sync \
     --user 1000:1000 \
     -e TZ=America/Chicago \
-    -v /srv/gphoto/data:/data \
-    -v /srv/gphoto/state:/state \
-    -v /srv/gphoto/rclone:/config/rclone \
-    -v /srv/gphoto/config.yaml:/config/config.yaml:ro \
-    -v /srv/gphoto/telegram.token:/config/telegram.token:ro \
-    ghcr.io/<owner>/gphoto-sync:latest sync
+    -v /home/leo/gphoto-backup/data:/data \
+    -v /home/leo/gphoto-backup/state:/state \
+    -v /home/leo/gphoto-sync/config/rclone:/config/rclone \
+    -v /home/leo/gphoto-sync/config/config.yaml:/config/config.yaml:ro \
+    -v /home/leo/gphoto-sync/config/telegram.token:/config/telegram.token:ro \
+    gphoto-sync:local sync
 ExecStop=-/usr/bin/docker stop -t 120 gphoto-sync
 ```
 
@@ -713,7 +785,7 @@ and the file mtime carry the capture date for files whose own EXIF lacks it.
 
 | Phase | Deliverable | Needs from you |
 |---|---|---|
-| 0 | Your rclone remote, Takeout schedule, Drive space: **done 2026-10-05**. Remaining: the same two steps per additional account, decisions in section 7 | one browser login per extra account |
+| 0 | rclone remote and Drive space: **done 2026-10-05**; server checked and part 1 of the real export available for tests: **done 2026-10-06**. Remaining: recreate your Takeout schedule with destination "Add to Drive" (the first one went to e-mail links), then the same steps per additional account | Takeout fix, one browser login per extra account |
 | 1 | `ingest` a local Takeout zip/dir → `library/`, `albums/`, SQLite, hardlinks, sidecars, idempotent re-runs, resume. Testable without rclone | one part of the real export to test against |
 | 2 | rclone discovery/fetch loop, `sync`, exit codes, Telegram pairing + reports, Docker image with rclone, systemd units, README | bot token, pairing from each phone |
 | 3 | `verify`, `relink`, `status`, `check-remote`, docs | — |
