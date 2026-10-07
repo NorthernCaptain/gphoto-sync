@@ -74,13 +74,22 @@ type Report struct {
 	Fatal    string
 }
 
+// Remote is the part of the rclone client the runner uses (*rclone.Client
+// implements it; tests substitute a fake).
+type Remote interface {
+	List(ctx context.Context, remote string) ([]rclone.RemoteFile, error)
+	CopyID(ctx context.Context, remoteName, id, dest string) error
+	MoveID(ctx context.Context, remoteName, id, destRemotePath string) error
+	DeleteFile(ctx context.Context, remotePath string) error
+}
+
 // Runner holds the dependencies.
 type Runner struct {
 	Cfg *config.Config
 	St  *store.Store
 	Log *slog.Logger
 	Ing *ingest.Ingester
-	RC  *rclone.Client
+	RC  Remote
 	Bot *telegram.Bot // nil when disabled
 	Now func() time.Time
 }
@@ -269,13 +278,15 @@ func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *Acco
 			ar.fail(ExitFatal, err.Error())
 			return ar
 		}
+		// whenever the row is about to record another Drive file (a resumed or
+		// replaced part re-uploaded under a new id), a deletion still owed for
+		// the old file (staged by a run whose delete failed) is finished first,
+		// or its id would be forgotten with the file left in staging
+		if arch != nil && arch.RemoteID != f.ID && !r.settleOldRemote(ctx, ar, acc.RcloneRemote, arch, files) {
+			ar.Notes = append(ar.Notes, fmt.Sprintf("%s: the earlier copy of this part still awaits deletion; the new copy waits for it", f.Name))
+			continue
+		}
 		if replaced {
-			// a deletion still owed for the old file (staged by a run whose delete
-			// failed) must be finished before the row records another id
-			if arch.RemoteID != f.ID && !r.settleOldRemote(ctx, ar, acc.RcloneRemote, arch, files) {
-				ar.Notes = append(ar.Notes, fmt.Sprintf("%s: the earlier copy of this part still awaits deletion; the replacement waits for it", f.Name))
-				continue
-			}
 			// the entry bookkeeping and occurrences belong to the old content; the
 			// new file is ingested from scratch (unchanged entries are idempotent)
 			// and the export's album listing is pruned again afterwards
@@ -335,8 +346,9 @@ func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *Acco
 	}
 
 	// parts staged for deletion by an earlier run whose delete step failed are
-	// no longer in the Takeout folder listing; finish them from the staging folder
-	if r.Cfg.Takeout.DeleteRemoteAfterIngest && !dryRun && acct.ID != 0 {
+	// no longer in the Takeout folder listing; finish them from the staging
+	// folder (files already staged are finished even with deletion turned off)
+	if !dryRun && acct.ID != 0 {
 		r.finishStagedDeletes(ctx, ar, acct.ID, acc.RcloneRemote, files)
 	}
 
@@ -560,6 +572,14 @@ func (r *Runner) deleteRemote(ctx context.Context, ar *AccountReport, remote str
 		ar.problem(fmt.Sprintf("%s: remote move: %v", f.Name, err))
 		return false
 	}
+	// evidence that a file of this part sits in staging: a failed delete is
+	// finished by a later run, and nothing may forget the id until then. The
+	// record is part of the operation: without it the delete is not attempted
+	// (the row stays in the awaiting set a later run inspects)
+	if err := r.St.SetArchiveStaged(ctx, arch.ID); err != nil {
+		ar.problem(fmt.Sprintf("%s: record staged deletion: %v", f.Name, err))
+		return false
+	}
 	if err := r.RC.DeleteFile(ctx, trashPath); err != nil {
 		// the file sits in the staging folder under its id; the next run finds it there
 		ar.problem(fmt.Sprintf("%s: remote delete (staged, retried next run): %v", f.Name, err))
@@ -589,6 +609,21 @@ func notDeletable(arch *store.Archive, f rclone.RemoteFile) string {
 	return ""
 }
 
+// mergeArchives appends the rows of b not already in a (by id).
+func mergeArchives(a, b []*store.Archive) []*store.Archive {
+	seen := map[int64]bool{}
+	for _, x := range a {
+		seen[x.ID] = true
+	}
+	for _, x := range b {
+		if !seen[x.ID] {
+			seen[x.ID] = true
+			a = append(a, x)
+		}
+	}
+	return a
+}
+
 // listStaged lists the staging folder; one that was never created is empty.
 func (r *Runner) listStaged(ctx context.Context, remote string) ([]rclone.RemoteFile, error) {
 	staged, err := r.RC.List(ctx, remote+"/"+trashFolder)
@@ -614,10 +649,8 @@ func (r *Runner) deleteStaged(ctx context.Context, ar *AccountReport, remote str
 		ar.Notes = append(ar.Notes, fmt.Sprintf("%s is no longer on Drive: recorded as deleted", a.Name))
 		return true
 	}
-	if a.Errors > 0 {
-		ar.problem(fmt.Sprintf("%s: staged file left alone: the part was ingested with errors", a.Name))
-		return false
-	}
+	// a file is only ever staged after a clean ingest of that very copy, so
+	// errors a later local ingest recorded for the part do not protect it
 	if why := notDeletable(a, *match); why != "" {
 		ar.problem(fmt.Sprintf("%s: staged file left alone: %s", a.Name, why))
 		return false
@@ -657,8 +690,22 @@ func (r *Runner) settleOldRemote(ctx context.Context, ar *AccountReport, remote 
 // staging folder without managing to delete them. A part that is in neither
 // the Takeout folder nor the staging folder is gone and recorded as deleted.
 func (r *Runner) finishStagedDeletes(ctx context.Context, ar *AccountReport, acctID int64, remote string, root []rclone.RemoteFile) {
-	waiting, err := r.St.ArchivesAwaitingRemoteDelete(ctx, acctID)
-	if err != nil || len(waiting) == 0 {
+	// files already in our staging folder are always finished, whatever the
+	// part's status became since (a later local ingest may have changed it);
+	// with deletion on, every ingested part still owing one is handled too
+	waiting, err := r.St.ArchivesStaged(ctx, acctID)
+	if err != nil {
+		ar.problem("list staged parts: " + err.Error())
+		return
+	}
+	if r.Cfg.Takeout.DeleteRemoteAfterIngest {
+		if more, err := r.St.ArchivesAwaitingRemoteDelete(ctx, acctID); err == nil {
+			waiting = mergeArchives(waiting, more)
+		} else {
+			ar.problem("list parts awaiting remote delete: " + err.Error())
+		}
+	}
+	if len(waiting) == 0 {
 		return
 	}
 	inRoot := map[string]bool{}
@@ -668,7 +715,7 @@ func (r *Runner) finishStagedDeletes(ctx context.Context, ar *AccountReport, acc
 	var staged []rclone.RemoteFile
 	listed := false
 	for _, a := range waiting {
-		if inRoot[a.RemoteID] || a.Errors > 0 {
+		if inRoot[a.RemoteID] {
 			continue // still in the Takeout folder: the main loop handles it
 		}
 		if !listed {

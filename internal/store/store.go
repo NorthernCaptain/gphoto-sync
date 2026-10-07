@@ -208,6 +208,7 @@ type Archive struct {
 	Status          string
 	LocalPath       string
 	RemoteDeletedAt string // when the Drive copy was confirmed deleted ("" while still owed)
+	StagedAt        string // when the Drive copy was moved into the staging folder ("" if never)
 	Entries         int
 	Ingested        int
 	Duplicates      int
@@ -234,6 +235,7 @@ func (s *Store) UpsertArchive(ctx context.Context, a *Archive) (*Archive, error)
 		  -- its size and hash as listed (the hash may be unknown), and its deletion still owed;
 		  -- a local ingest (no remote_id) keeps what is known
 		  remote_deleted_at = CASE WHEN excluded.remote_id IS NOT NULL THEN NULL ELSE remote_deleted_at END,
+		  staged_at = CASE WHEN excluded.remote_id IS NOT NULL THEN NULL ELSE staged_at END,
 		  size = CASE WHEN excluded.remote_id IS NOT NULL THEN excluded.size ELSE COALESCE(excluded.size, size) END,
 		  md5 = CASE WHEN excluded.remote_id IS NOT NULL THEN excluded.md5 ELSE COALESCE(excluded.md5, md5) END,
 		  remote_id = COALESCE(excluded.remote_id, remote_id), name = excluded.name,
@@ -246,16 +248,16 @@ func (s *Store) UpsertArchive(ctx context.Context, a *Archive) (*Archive, error)
 	return s.GetArchive(ctx, a.AccountID, a.ExportID, a.PartNo)
 }
 
-const archiveCols = `id, account_id, remote_id, name, export_id, part_no, size, md5, status, local_path, remote_deleted_at, entries, ingested, duplicates, errors`
+const archiveCols = `id, account_id, remote_id, name, export_id, part_no, size, md5, status, local_path, remote_deleted_at, staged_at, entries, ingested, duplicates, errors`
 
 func scanArchive(sc interface{ Scan(...any) error }) (*Archive, error) {
 	var a Archive
-	var remote, md5, local, deleted sql.NullString
+	var remote, md5, local, deleted, staged sql.NullString
 	var size sql.NullInt64
-	if err := sc.Scan(&a.ID, &a.AccountID, &remote, &a.Name, &a.ExportID, &a.PartNo, &size, &md5, &a.Status, &local, &deleted, &a.Entries, &a.Ingested, &a.Duplicates, &a.Errors); err != nil {
+	if err := sc.Scan(&a.ID, &a.AccountID, &remote, &a.Name, &a.ExportID, &a.PartNo, &size, &md5, &a.Status, &local, &deleted, &staged, &a.Entries, &a.Ingested, &a.Duplicates, &a.Errors); err != nil {
 		return nil, err
 	}
-	a.RemoteID, a.MD5, a.LocalPath, a.Size, a.RemoteDeletedAt = remote.String, md5.String, local.String, size.Int64, deleted.String
+	a.RemoteID, a.MD5, a.LocalPath, a.Size, a.RemoteDeletedAt, a.StagedAt = remote.String, md5.String, local.String, size.Int64, deleted.String, staged.String
 	return &a, nil
 }
 
@@ -333,9 +335,36 @@ func (s *Store) SetArchiveStatus(ctx context.Context, id int64, status, localPat
 // SetArchiveRemote records the Drive file an already ingested part was
 // matched to by content (a re-upload with a new id).
 func (s *Store) SetArchiveRemote(ctx context.Context, id int64, remoteID string, size int64, md5 string) error {
-	_, err := s.q.ExecContext(ctx, `UPDATE archives SET remote_id = ?, size = COALESCE(?, size), md5 = COALESCE(?, md5), remote_deleted_at = NULL WHERE id = ?`,
+	_, err := s.q.ExecContext(ctx, `UPDATE archives SET remote_id = ?, size = COALESCE(?, size), md5 = COALESCE(?, md5), remote_deleted_at = NULL, staged_at = NULL WHERE id = ?`,
 		nullStr(remoteID), nullInt(size), nullStr(md5), id)
 	return err
+}
+
+// SetArchiveStaged records that the part's Drive copy was moved into the
+// staging folder; only a completed deletion (SetArchiveRemoteDeleted) or a
+// new remote file supersedes it.
+func (s *Store) SetArchiveStaged(ctx context.Context, id int64) error {
+	_, err := s.q.ExecContext(ctx, `UPDATE archives SET staged_at = ? WHERE id = ?`, Now(), id)
+	return err
+}
+
+// ArchivesStaged lists parts whose Drive copy sits in the staging folder
+// with its deletion unfinished, whatever their status.
+func (s *Store) ArchivesStaged(ctx context.Context, accountID int64) ([]*Archive, error) {
+	rows, err := s.q.QueryContext(ctx, `SELECT `+archiveCols+` FROM archives WHERE account_id = ? AND staged_at IS NOT NULL AND remote_deleted_at IS NULL ORDER BY export_id, part_no`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Archive
+	for rows.Next() {
+		a, err := scanArchive(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // exportOrderDesc orders export ids (<timestamp>-<sequence>) newest first, by
@@ -346,7 +375,7 @@ const exportOrderDesc = `substr(export_id, 1, instr(export_id, '-') - 1) DESC, C
 // ingested from (Drive id, hash, size, deletion state): a local replacement of
 // unknown identity must not let a later sync match the old Drive file to it.
 func (s *Store) ForgetArchiveSource(ctx context.Context, id int64) error {
-	_, err := s.q.ExecContext(ctx, `UPDATE archives SET remote_id = NULL, md5 = NULL, size = NULL, remote_deleted_at = NULL WHERE id = ?`, id)
+	_, err := s.q.ExecContext(ctx, `UPDATE archives SET remote_id = NULL, md5 = NULL, size = NULL, remote_deleted_at = NULL, staged_at = NULL WHERE id = ?`, id)
 	return err
 }
 

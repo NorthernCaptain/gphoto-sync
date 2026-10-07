@@ -56,6 +56,42 @@ func TestUpsertArchiveClearsDeletionOnNewRemote(t *testing.T) {
 	}
 }
 
+// A staged copy is listed for cleanup whatever the part's status became.
+func TestStagedArchivesListedRegardlessOfStatus(t *testing.T) {
+	ctx := context.Background()
+	d, err := db.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	st := New(d)
+	acct, _ := st.EnsureAccount(ctx, "leo", "r:")
+	a, err := st.UpsertArchive(ctx, &Archive{AccountID: acct.ID, RemoteID: "x", Name: "p", ExportID: "e-1", PartNo: 1, MD5: "aa", Status: ArchiveIngested})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetArchiveStaged(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	// a local ingest of the same part changes the status but not the staging
+	if _, err := st.UpsertArchive(ctx, &Archive{AccountID: acct.ID, Name: "p", ExportID: "e-1", PartNo: 1, Status: ArchiveWithErrors}); err != nil {
+		t.Fatal(err)
+	}
+	if w, _ := st.ArchivesAwaitingRemoteDelete(ctx, acct.ID); len(w) != 0 {
+		t.Fatalf("non-ingested row listed as awaiting deletion: %d", len(w))
+	}
+	s, _ := st.ArchivesStaged(ctx, acct.ID)
+	if len(s) != 1 || s[0].RemoteID != "x" || s[0].StagedAt == "" {
+		t.Fatalf("staged row not listed: %+v", s)
+	}
+	if err := st.SetArchiveRemoteDeleted(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := st.ArchivesStaged(ctx, acct.ID); len(s) != 0 {
+		t.Fatalf("finished staged row still listed: %d", len(s))
+	}
+}
+
 // A Drive file id recorded by one account is not another account's ingest.
 func TestArchiveLookupIsPerAccount(t *testing.T) {
 	ctx := context.Background()

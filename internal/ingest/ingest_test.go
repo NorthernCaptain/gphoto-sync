@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gphoto-sync/internal/config"
@@ -680,17 +681,40 @@ func TestReplacedLocalPartDetected(t *testing.T) {
 	if r := ingestSized(p, Options{}); r.Replaced || r.Duplicates != 0 || r.Added != 0 {
 		t.Fatalf("unchanged re-ingest: %+v", r)
 	}
-	// as if sync had fetched it from Drive
+	// as if sync had fetched it from Drive (with errors: nothing was ever staged)
 	acct, _ := f.st.GetAccount(f.ctx, "leo")
-	if _, err := f.st.UpsertArchive(f.ctx, &store.Archive{AccountID: acct.ID, RemoteID: "drive-id", Name: name, ExportID: "20261006T035113Z-1", PartNo: 1, MD5: "abc", Status: store.ArchiveIngested}); err != nil {
+	arch, err := f.st.UpsertArchive(f.ctx, &store.Archive{AccountID: acct.ID, RemoteID: "drive-id", Name: name, ExportID: "20261006T035113Z-1", PartNo: 1, MD5: "abc", Status: store.ArchiveWithErrors})
+	if err != nil {
 		t.Fatal(err)
 	}
 	// --replace on the unchanged file re-evaluates every entry and forgets the Drive identity
 	if r := ingestSized(p, Options{Replace: true}); !r.Replaced || r.Duplicates != 1 || r.Changed != 0 {
 		t.Fatalf("forced replace: %+v", r)
 	}
-	if arch, _ := f.st.GetArchive(f.ctx, acct.ID, "20261006T035113Z-1", 1); arch.RemoteID != "" || arch.MD5 != "" {
+	if arch, _ = f.st.GetArchive(f.ctx, acct.ID, "20261006T035113Z-1", 1); arch.RemoteID != "" || arch.MD5 != "" {
 		t.Errorf("local replacement kept the Drive identity: %+v", arch)
+	}
+	// a copy moved into the Drive staging folder whose delete failed: only sync can finish it
+	if _, err := f.st.UpsertArchive(f.ctx, &store.Archive{AccountID: acct.ID, RemoteID: "drive-id-2", Name: name, ExportID: "20261006T035113Z-1", PartNo: 1, MD5: "abc", Status: store.ArchiveIngested}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.SetArchiveStaged(f.ctx, arch.ID); err != nil {
+		t.Fatal(err)
+	}
+	src, err := OpenZip(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.ing.IngestPart(f.ctx, src, PartMeta{Account: "leo", ExportID: "20261006T035113Z-1", PartNo: 1, Name: name}, Options{Replace: true})
+	src.Close()
+	if err == nil || !strings.Contains(err.Error(), "staged for deletion") {
+		t.Fatalf("local replace with a staged copy was not refused: %v", err)
+	}
+	if err := f.st.SetArchiveRemoteDeleted(f.ctx, arch.ID); err != nil {
+		t.Fatal(err)
+	}
+	if r := ingestSized(p, Options{Replace: true}); !r.Replaced {
+		t.Fatalf("replace after the staged deletion finished: %+v", r)
 	}
 	// a changed zip (other bytes, other size) is detected and ingested again
 	b := randBytes(140)

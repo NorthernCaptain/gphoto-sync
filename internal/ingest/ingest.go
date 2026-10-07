@@ -335,11 +335,18 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 	if prev, err := ing.st.GetArchive(ctx, acct.ID, part.ExportID, part.PartNo); err != nil {
 		return nil, err
 	} else if prev != nil && (opt.Replace || partDiffers(prev, part)) {
+		local := part.RemoteID == "" && part.MD5 == ""
+		if local && prev.StagedAt != "" && prev.RemoteDeletedAt == "" {
+			// a copy of this part sits in the Drive staging folder (moved by a run
+			// whose delete failed); forgetting its id here would strand it, and
+			// only sync can finish that deletion
+			return nil, fmt.Errorf("part %s has a copy staged for deletion on Drive (id %s) that is not deleted yet: run `gphoto-sync sync` first, then replace it", part.Name, prev.RemoteID)
+		}
 		ing.log.Warn("part differs from the earlier ingest, starting over", "part", part.Name, "forced", opt.Replace)
 		if err := ing.st.ResetPartForReingest(ctx, prev.ID, acct.ID, part.ExportID, part.PartNo); err != nil {
 			return nil, err
 		}
-		if part.RemoteID == "" && part.MD5 == "" {
+		if local {
 			// a local file of unknown identity: the row must not keep claiming the
 			// Drive file it was fetched from, or a later sync could trash that file
 			if err := ing.st.ForgetArchiveSource(ctx, prev.ID); err != nil {

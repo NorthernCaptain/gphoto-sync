@@ -615,6 +615,8 @@ gphoto-sync sync [--account NAME] [--dry-run]              # all accounts by def
 gphoto-sync ingest --account NAME <dir|zip>... [--full-albums --parts N] [--replace]   # local Takeout dump, no rclone
                                                            # a part ingested before under the same name resumes; a zip
                                                            # known to differ (md5, else size) or --replace starts it over
+                                                           # (refused while a copy of the part sits in the Drive staging
+                                                           #  folder with its deletion unfinished: sync finishes it)
 gphoto-sync exports confirm --account NAME --export ID --parts N   # record the part count Google reports
 gphoto-sync retry --account NAME [--part NAME]             # reset given-up entries so the next run retries them
 gphoto-sync check-remote [--account NAME]                  # list parts rclone can see and their state
