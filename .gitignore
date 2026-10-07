@@ -1,0 +1,11 @@
+# local credentials and runtime config (also excluded from the Docker build context)
+/config/*
+!/config/config.example.yaml
+# build output
+/bin/
+/dist/
+*.test
+*.out
+# local state used by tests / dev runs
+/.state/
+/.data/

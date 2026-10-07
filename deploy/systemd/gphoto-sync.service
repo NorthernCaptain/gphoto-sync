@@ -1,0 +1,18 @@
+[Unit]
+Description=Google Photos Takeout sync (one-shot container)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+TimeoutStopSec=180
+ExecStartPre=-/usr/bin/docker rm -f gphoto-sync
+ExecStart=/usr/bin/docker run --rm --name gphoto-sync \
+    --user 1000:1000 \
+    -e TZ=America/Chicago \
+    -v /home/leo/gphoto-backup/data:/data \
+    -v /home/leo/gphoto-backup/state:/state \
+    -v /home/leo/gphoto-sync/config:/config \
+    gphoto-sync:local sync
+ExecStop=-/usr/bin/docker stop -t 120 gphoto-sync

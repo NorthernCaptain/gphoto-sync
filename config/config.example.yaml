@@ -1,0 +1,49 @@
+# gphoto-sync configuration. Copy to config/config.yaml (git-ignored) and edit.
+data_dir: /data            # <account>/library and <account>/albums live here (one filesystem)
+state_dir: /state          # state.db, inbox/ staging, lock, run logs
+timezone: ""               # empty = the container's TZ; set only to override it
+workers: 4                 # hashing / exif / linking parallelism
+
+rclone:
+  binary: /usr/local/bin/rclone
+  config: /config/rclone/rclone.conf   # one file, one [section] per account; mounted read-write
+  extra_args: ["--multi-thread-streams", "4", "--retries", "5", "--low-level-retries", "20"]
+
+accounts:                  # key = e-mail local part = folder name under data_dir
+  leo:
+    rclone_remote: "gdrive-leo:Takeout"
+  # jane:
+  #   rclone_remote: "gdrive-jane:Takeout"
+  #   takeout: { settle: 4h }
+
+layout:
+  library: "{year}/{month}"          # under data_dir/<account>/library (the only supported layout)
+  albums: "albums"                   # own and shared albums alike
+  link_mode: hardlink                # hardlink | symlink | copy
+  keep_sidecar_json: true            # Takeout sidecar kept next to the file as <name>.json
+  edited_versions: keep_both         # keep_both | prefer_edited | prefer_original
+  collision: identity_suffix         # IMG_1234~3fa9c1d2.jpg, hash of the item identity
+
+takeout:
+  inbox_dir: /state/inbox
+  pattern: "takeout-*.zip"
+  settle: 2h                         # ignore parts modified more recently than this
+  keep_archives: false               # delete local part after successful ingest
+  delete_remote_after_ingest: false  # turn on after the first full export is verified
+  expected_interval: 720h            # 30 days; overdue after this + grace
+  grace: 336h
+  include_trash: false               # Google's Trash/ folder: skipped by default
+  include_archive: true              # Google's Archive/ folder: ingested, flagged archived
+  max_entry_attempts: 3              # runs before a failing entry is given up
+  export_complete_after: 168h        # no new part for 7 days -> report asks to confirm the part count
+  product_folders: ["Google Photos"] # Takeout/<product>/ folders that belong to Photos (localized names go here)
+
+telegram:
+  enabled: false
+  bot_token_file: /config/telegram.token
+  notify_on: [success, partial, unresolved, failure, overdue]
+  drain_updates_on_sync: true        # process /stop and advance the offset; pairing stays closed
+
+log:
+  level: info                        # debug | info | warn | error
+  format: json                       # json | text

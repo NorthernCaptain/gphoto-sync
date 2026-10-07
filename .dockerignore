@@ -1,0 +1,12 @@
+# credentials never enter the build context
+config/
+.git/
+.github/
+bin/
+dist/
+.state/
+.data/
+*.md
+*.test
+*.out
+deploy/
