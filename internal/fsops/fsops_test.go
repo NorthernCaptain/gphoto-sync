@@ -59,3 +59,20 @@ func TestIdempotentOps(t *testing.T) {
 		t.Errorf("free bytes: %d %v", n, err)
 	}
 }
+
+func TestLockIsExclusive(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "lock")
+	f, err := Lock(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Lock(p); err == nil {
+		t.Fatal("second lock on the same path succeeded")
+	}
+	f.Close()
+	g, err := Lock(p)
+	if err != nil {
+		t.Fatalf("lock after release: %v", err)
+	}
+	g.Close()
+}

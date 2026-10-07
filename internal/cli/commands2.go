@@ -91,7 +91,7 @@ func cmdCheckRemote(ctx context.Context, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return ExitFatal
 	}
-	e, err := setup(ctx, *cfgPath)
+	e, err := setupMode(ctx, *cfgPath, true)
 	if err != nil {
 		return fatal(err)
 	}
@@ -116,10 +116,17 @@ func cmdCheckRemote(ctx context.Context, args []string) int {
 				fmt.Printf("  drive: used %.1f GB, free %.1f GB\n", float64(about["used"])/1e9, float64(about["free"])/1e9)
 			}
 		}
+		acctRow, _ := e.st.GetAccount(ctx, name)
+		var acctID int64
+		if acctRow != nil {
+			acctID = acctRow.ID
+		}
 		for _, f := range files {
 			state := "new"
-			if a, _ := e.st.GetArchiveByRemoteID(ctx, f.ID); a != nil {
+			if a, _ := e.st.GetArchiveByRemoteID(ctx, acctID, f.ID); a != nil {
 				state = a.Status
+			} else if o, _ := e.st.ArchiveByRemoteIDAnyAccount(ctx, f.ID); o != nil {
+				state = "recorded by another account (shared folder?)"
 			}
 			mark := ""
 			if _, _, ok := ingest.ParsePartName(f.Name); !ok {
@@ -208,7 +215,10 @@ func cmdTelegram(ctx context.Context, args []string) int {
 	if err := fs.Parse(args[1:]); err != nil {
 		return ExitFatal
 	}
-	e, err := setup(ctx, *cfgPath)
+	// pairing and revocation write telegram state and must not overlap a sync
+	// draining the same update stream; listing and test only read
+	readOnly := sub != "pair" && !(sub == "chats" && *revoke != 0)
+	e, err := setupMode(ctx, *cfgPath, readOnly)
 	if err != nil {
 		return fatal(err)
 	}

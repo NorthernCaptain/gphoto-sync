@@ -54,6 +54,15 @@ func ParsePartName(name string) (exportID string, partNo int, ok bool) {
 	return m[1] + "-" + m[2], n, true
 }
 
+// partDiffers reports whether a part file is known to differ from the one an
+// archive row was recorded for: by MD5 when both are known, else by size.
+func partDiffers(prev *store.Archive, part PartMeta) bool {
+	if prev.MD5 != "" && part.MD5 != "" {
+		return prev.MD5 != part.MD5
+	}
+	return prev.Size > 0 && part.Size > 0 && prev.Size != part.Size
+}
+
 // ExportOlder reports whether export id a is older than b (timestamp, then sequence).
 func ExportOlder(a, b string) bool {
 	ta, sa := splitExportID(a)
@@ -79,6 +88,7 @@ type Options struct {
 	DryRun     bool // classify and report only
 	FullAlbums bool // mark the export authoritative (requires Parts)
 	Parts      int  // confirmed part count of the export
+	Replace    bool // the file replaces an earlier ingest of this part: forget its bookkeeping first
 }
 
 // Result summarises one part.
@@ -90,6 +100,9 @@ type Result struct {
 	Added           int
 	Duplicates      int
 	Changed         int
+	Versioned       int  // differing bytes from an older export, kept as versions
+	Replaced        bool // an earlier ingest of this part was forgotten before this one
+	Unlinked        int  // album links removed because no ingested part lists them any more
 	Promoted        int
 	Merged          int
 	Links           int
@@ -134,21 +147,26 @@ type folderCtx struct {
 }
 
 type job struct {
-	e       SourceEntry
-	ce      takeout.Entry
-	fc      *folderCtx
-	match   *takeout.Match
-	pending string // media key of a pending sidecar consumed from an earlier part
+	e     SourceEntry
+	ce    takeout.Entry
+	fc    *folderCtx
+	match *takeout.Match
+	// pending is the media key of a sidecar taken from pending_sidecars. The row
+	// is kept: the same sidecar also serves the edited and motion companions of
+	// the media, which may arrive in later parts (status counts only rows whose
+	// media is still missing).
+	pending string
 }
 
 type extracted struct {
 	job
-	tmpRel   string
+	tmpRel   string // temp file holding the bytes; empty when they already live in the library
 	sha      string
 	size     int64
 	exifTime time.Time
 	exifSrc  string
 	err      error
+	exportID string // export that supplied the bytes, when not this part's
 }
 
 type partRun struct {
@@ -162,6 +180,29 @@ type partRun struct {
 	folders map[string]*folderCtx
 	res     Result
 	tmpDir  string
+
+	prunedListing       string // newest complete listing applied to the account (lazy)
+	prunedListingLoaded bool
+}
+
+// appliedListing returns the newest complete album listing that applies to an
+// album: the one recorded for the album, else (for an album created after the
+// last pruning) the newest one applied to the account.
+func (pr *partRun) appliedListing(album *store.Album) (string, error) {
+	applied, err := pr.ing.st.GetAlbumFull(pr.ctx, album.ID)
+	if err != nil {
+		return "", err
+	}
+	if !pr.prunedListingLoaded {
+		if pr.prunedListing, err = pr.ing.st.NewestPrunedExport(pr.ctx, pr.acct.ID); err != nil {
+			return "", err
+		}
+		pr.prunedListingLoaded = true
+	}
+	if pr.prunedListing != "" && (applied == "" || ExportOlder(applied, pr.prunedListing)) {
+		return pr.prunedListing, nil
+	}
+	return applied, nil
 }
 
 // IngestPart processes one part. It is safe to call again for the same part:
@@ -172,7 +213,16 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 	pr.res.Part = part.Name
 	pr.tmpDir = path.Join(part.Account, ".tmp")
 
-	acct, err := ing.st.EnsureAccount(ctx, part.Account, part.RcloneRemote)
+	var acct *store.Account
+	var err error
+	if opt.DryRun {
+		// read-only: never create the account row
+		if acct, err = ing.st.GetAccount(ctx, part.Account); err == nil && acct == nil {
+			acct = &store.Account{Name: part.Account}
+		}
+	} else {
+		acct, err = ing.st.EnsureAccount(ctx, part.Account, part.RcloneRemote)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -279,6 +329,25 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 			return nil, err
 		}
 	}
+	// a part ingested before under this name: when the file is known to differ
+	// (hash, else size) or the caller says so, its bookkeeping belongs to the
+	// old content and is forgotten; a file of unknown identity resumes
+	if prev, err := ing.st.GetArchive(ctx, acct.ID, part.ExportID, part.PartNo); err != nil {
+		return nil, err
+	} else if prev != nil && (opt.Replace || partDiffers(prev, part)) {
+		ing.log.Warn("part differs from the earlier ingest, starting over", "part", part.Name, "forced", opt.Replace)
+		if err := ing.st.ResetPartForReingest(ctx, prev.ID, acct.ID, part.ExportID, part.PartNo); err != nil {
+			return nil, err
+		}
+		if part.RemoteID == "" && part.MD5 == "" {
+			// a local file of unknown identity: the row must not keep claiming the
+			// Drive file it was fetched from, or a later sync could trash that file
+			if err := ing.st.ForgetArchiveSource(ctx, prev.ID); err != nil {
+				return nil, err
+			}
+		}
+		pr.res.Replaced = true
+	}
 	arch, err := ing.st.UpsertArchive(ctx, &store.Archive{AccountID: acct.ID, RemoteID: part.RemoteID, Name: part.Name, ExportID: part.ExportID,
 		PartNo: part.PartNo, Size: part.Size, MD5: part.MD5, Status: store.ArchiveIngesting, LocalPath: part.LocalPath})
 	if err != nil {
@@ -297,11 +366,13 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 	for _, b := range badEntries {
 		pr.failNamed(b.name, b.err)
 	}
-	if prevFailed, err := ing.st.EntryNamesByStatus(ctx, arch.ID, store.EntryFailed, store.EntryGivenUp); err == nil && len(prevFailed) > 0 {
-		for _, name := range goodDescriptors {
-			if prevFailed[name] {
-				_ = ing.st.MarkEntry(ctx, arch.ID, name, store.EntryDone, 0, "")
-			}
+	prevFailed, err := ing.st.EntryNamesByStatus(ctx, arch.ID, store.EntryFailed, store.EntryGivenUp)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range goodDescriptors {
+		if prevFailed[name] {
+			_ = ing.st.MarkEntry(ctx, arch.ID, name, store.EntryDone, 0, "")
 		}
 	}
 	if n, err := ing.st.CountExports(ctx, acct.ID); err == nil && n == 1 {
@@ -309,7 +380,14 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 		_ = ing.st.SetExportAuthoritative(ctx, acct.ID, part.ExportID)
 	}
 
-	// albums and late sidecars (promotion of fallback items from earlier parts)
+	// albums and late sidecars (media ingested from earlier parts, or from an
+	// earlier run of this part whose sidecar could not be read then)
+	doneMedia := map[string]bool{} // "<folder>/<base>" of media entries finished by an earlier run
+	for _, j := range mediaEntries {
+		if done[j.e.Name] {
+			doneMedia[j.fc.name+"/"+j.ce.Base] = true
+		}
+	}
 	for _, fc := range pr.folders {
 		if fc.kind == takeout.FolderAlbum && (fc.meta != nil || fc.hasMedia) {
 			a, err := pr.ensureAlbum(fc)
@@ -318,7 +396,7 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 			}
 			fc.album = a
 		}
-		if err := pr.promoteFromEarlierParts(fc); err != nil {
+		if err := pr.applyLateSidecars(fc, doneMedia, prevFailed); err != nil {
 			return nil, err
 		}
 	}
@@ -400,7 +478,7 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 			if occ, err := ing.st.FindOccurrence(ctx, acct.ID, part.ExportID, fc.name, u.Key); err == nil && occ != nil && occ.ItemID != 0 {
 				continue
 			}
-			if err := ing.st.PutPendingSidecar(ctx, acct.ID, part.ExportID, fc.name, u.Key, u.SC.Raw); err != nil {
+			if err := ing.st.PutPendingSidecar(ctx, acct.ID, part.ExportID, part.PartNo, fc.name, u.Key, u.SC.Raw); err != nil {
 				return nil, err
 			}
 			pr.res.PendingSidecars++
@@ -423,6 +501,20 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 		status = store.ArchiveWithErrors
 	}
 	pr.res.Status = status
+	if status == store.ArchiveIngested {
+		// memberships are derived from active occurrences; a replaced part (or a
+		// resumed ingest of one) may have left direct links nothing supports.
+		// This runs before the part is marked ingested so that a failure here
+		// leaves it resumable and the reconciliation is tried again
+		n, err := ing.ReconcileMemberships(ctx, acct, arch.ID)
+		if err != nil {
+			return nil, fmt.Errorf("reconcile memberships: %w", err)
+		}
+		pr.res.Unlinked = n
+		if err := ing.st.ClearResetState(ctx, acct.ID, part.ExportID, part.PartNo); err != nil {
+			return nil, err
+		}
+	}
 	if err := ing.st.FinishArchive(ctx, arch.ID, status, pr.res.Media, counts[store.EntryDone], pr.res.Duplicates, pr.res.Failed+pr.res.GivenUp); err != nil {
 		return nil, err
 	}
@@ -482,14 +574,15 @@ func (pr *partRun) resolveSidecar(j job) *takeout.Match {
 		return &m
 	}
 	for _, k := range takeout.LookupKeys(j.ce.Base) {
-		raw, err := pr.ing.st.GetPendingSidecar(pr.ctx, pr.acct.ID, pr.part.ExportID, j.fc.name, k.Key)
-		if err != nil || raw == nil {
+		p, err := pr.ing.st.GetPendingSidecar(pr.ctx, pr.acct.ID, pr.part.ExportID, j.fc.name, k.Key)
+		if err != nil || p == nil {
 			continue
 		}
-		sc, err := takeout.ParseSidecar(raw)
+		sc, err := takeout.ParseSidecar(p.Raw)
 		if err != nil {
 			continue
 		}
+		sc.SourcePart = p.PartNo
 		return &takeout.Match{Sidecar: sc, Variant: k.Variant, Still: k.Still, Key: k.Key}
 	}
 	// a sidecar stored under a truncated media name by an earlier part: the
@@ -498,11 +591,12 @@ func (pr *partRun) resolveSidecar(j job) *takeout.Match {
 	if cands, err := pr.ing.st.PendingSidecarsByPrefix(pr.ctx, pr.acct.ID, pr.part.ExportID, j.fc.name, j.ce.Base); err == nil && len(cands) > 0 {
 		var hit *takeout.Match
 		n := 0
-		for key, raw := range cands {
-			sc, err := takeout.ParseSidecar(raw)
+		for key, p := range cands {
+			sc, err := takeout.ParseSidecar(p.Raw)
 			if err != nil || !strings.EqualFold(sc.Title, j.ce.Base) {
 				continue
 			}
+			sc.SourcePart = p.PartNo
 			n++
 			variant, still := takeout.VariantOriginal, j.ce.Base
 			if orig, edited := takeout.IsEdited(j.ce.Base); edited {
@@ -628,13 +722,18 @@ func suffixed(name, suffix string) string {
 	return r + "~" + suffix + ext
 }
 
-// libraryPath returns a free library path for a new item, applying the
-// identity suffix on collisions with other items. When sha and size are given,
-// a path occupied on disk by an unrecorded file is used only if that file has
-// exactly this content (adopted after a crash); otherwise it is skipped.
-func (pr *partRun) libraryPath(dir, name, key string, exceptItem int64, sha string, size int64) (p string, adopted bool, err error) {
+// libraryPath returns a free library path for an item, applying the identity
+// suffix on collisions with other items. For an existing item (exceptItem,
+// ownPath) its current path is kept whenever it is a candidate. When sha and
+// size are given, a path occupied on disk by an unrecorded file is used only
+// if that file has exactly this content (adopted after a crash); otherwise it
+// is skipped.
+func (pr *partRun) libraryPath(dir, name, key string, exceptItem int64, ownPath, sha string, size int64) (p string, adopted bool, err error) {
 	cands := []string{path.Join(dir, name), path.Join(dir, suffixed(name, hash8(key))), path.Join(dir, suffixed(name, hash8(key)+hash8(key+"#2")))}
 	for _, p := range cands {
+		if ownPath != "" && p == ownPath {
+			return p, false, nil
+		}
 		taken, err := pr.ing.st.LibPathTaken(pr.ctx, p, exceptItem)
 		if err != nil {
 			return "", false, err
@@ -687,22 +786,70 @@ func (pr *partRun) linkStep(src, dst string) Step {
 
 func sidecarPath(libPath string) string { return libPath + ".json" }
 
+// movePath picks the destination for an existing item whose name or capture
+// time changed. Its current path is kept when it still fits; a destination
+// already holding the item's own bytes is adopted (a crash between the
+// journaled rename and its database commit leaves the file there after journal
+// replay while the item still records the old path), so the rename step then
+// finds its work done and the database catches up.
+func (pr *partRun) movePath(item *store.Item, blob *store.Blob, dir, name, key string) (string, error) {
+	sha, size := "", int64(0)
+	if blob != nil {
+		sha, size = blob.SHA256, blob.Size
+	}
+	p, adopted, err := pr.libraryPath(dir, name, key, item.ID, item.LibPath, sha, size)
+	if err != nil {
+		return "", err
+	}
+	if adopted {
+		pr.ing.log.Warn("destination already holds the item's bytes, adopting it", "from", item.LibPath, "to", p)
+	}
+	return p, nil
+}
+
 // symlinkMoveSteps re-points an item's album symlinks when its library path
 // moves; hardlinks follow the inode and copies are independent, so only
 // symlink mode needs this.
-func (pr *partRun) symlinkMoveSteps(item *store.Item, newPath string) ([]Step, error) {
-	if pr.ing.cfg.Layout.LinkMode != "symlink" {
-		return nil, nil
-	}
+// linkMoveSteps makes an item's album links follow its library file to a new
+// path: when the file name changes the links are renamed as well (hardlinks
+// and copies keep their inode or bytes), symlinks are re-pointed. It returns
+// the file steps and the membership rows whose link_path changes, to be
+// written in the same transaction as the item.
+func (pr *partRun) linkMoveSteps(item *store.Item, newPath string) ([]Step, []*store.AlbumItem, error) {
 	ais, err := pr.ing.st.AlbumItemsByItem(pr.ctx, item.ID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var steps []Step
+	var moved []*store.AlbumItem
+	nameChanged := path.Base(newPath) != path.Base(item.LibPath)
 	for _, ai := range ais {
-		steps = append(steps, Step{Op: "unlink", Dst: ai.LinkPath}, Step{Op: "symlink", Src: newPath, Dst: ai.LinkPath})
+		newLink := ai.LinkPath
+		if nameChanged {
+			album, err := pr.ing.st.GetAlbum(pr.ctx, ai.AlbumID)
+			if err != nil {
+				return nil, nil, err
+			}
+			if album == nil {
+				continue
+			}
+			// the file may already sit at either path (journal replay after a crash)
+			if newLink, err = pr.linkPathForName(album, item, path.Base(newPath), item.LibPath, newPath); err != nil {
+				return nil, nil, err
+			}
+		}
+		switch {
+		case pr.ing.cfg.Layout.LinkMode == "symlink":
+			steps = append(steps, Step{Op: "unlink", Dst: ai.LinkPath}, Step{Op: "symlink", Src: newPath, Dst: newLink})
+		case newLink != ai.LinkPath:
+			steps = append(steps, Step{Op: "rename", Src: ai.LinkPath, Dst: newLink})
+		}
+		if newLink != ai.LinkPath {
+			ai.LinkPath = newLink
+			moved = append(moved, ai)
+		}
 	}
-	return steps, nil
+	return steps, moved, nil
 }
 
 func (pr *partRun) writeSidecarFile(libPath string, sc *takeout.Sidecar) error {
@@ -728,7 +875,11 @@ func (pr *partRun) saveSidecar(tx *store.Store, itemID int64, sc *takeout.Sideca
 		b, _ := json.Marshal(names)
 		people = string(b)
 	}
-	return tx.UpsertSidecar(pr.ctx, itemID, sc.Raw, sc.SHA256, sc.Description, sc.Favorited, lat, lon, alt, people)
+	partNo := pr.part.PartNo
+	if sc.SourcePart != 0 {
+		partNo = sc.SourcePart // taken from the pending store: that part supplied it
+	}
+	return tx.UpsertSidecar(pr.ctx, itemID, sc.Raw, sc.SHA256, sc.Description, sc.Favorited, lat, lon, alt, people, pr.part.ExportID, partNo)
 }
 
 // ---- commit ----------------------------------------------------------------
@@ -823,18 +974,47 @@ func (pr *partRun) commit(x extracted) (err error) {
 		return err
 	}
 	if albumID != 0 {
-		if err := pr.ensureDirect(fc.album, item); err != nil {
+		if _, err := pr.ensureDirect(fc.album, item); err != nil {
 			return fmt.Errorf("album link: %w", err)
+		}
+		// whether linked (by newer evidence) or excluded by a newer complete
+		// listing, occurrences older than that listing are history, never
+		// support for a membership
+		if err := pr.retireOccurrences(fc.album, item); err != nil {
+			return err
 		}
 	}
 	return pr.ensureGroupLinks(item)
+}
+
+// retireOccurrences deactivates the active occurrences of an (album, item)
+// pair that are older than the newest applied complete listing, so that they
+// never count as support for a membership (a later replacement of a newer
+// part must not find them and keep a stale link).
+func (pr *partRun) retireOccurrences(album *store.Album, item *store.Item) error {
+	applied, err := pr.appliedListing(album)
+	if err != nil || applied == "" {
+		return err
+	}
+	occs, err := pr.ing.st.OccurrencesForMembership(pr.ctx, album.ID, item.ID)
+	if err != nil {
+		return err
+	}
+	for _, o := range occs {
+		if ExportOlder(o.ExportID, applied) {
+			if err := pr.ing.st.DeactivateOccurrence(pr.ctx, o.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (pr *partRun) create(x extracted, sc *takeout.Sidecar, variant, name, key, src, googleID string) (*store.Item, error) {
 	ctx, st := pr.ctx, pr.ing.st
 	taken, takenSrc := pr.resolveTime(sc, x.exifTime, x.exifSrc, x.fc.year)
 	dir := pr.libraryDir(taken, takenSrc)
-	libPath, adopted, err := pr.libraryPath(dir, name, key, 0, x.sha, x.size)
+	libPath, adopted, err := pr.libraryPath(dir, name, key, 0, "", x.sha, x.size)
 	if err != nil {
 		return nil, err
 	}
@@ -862,7 +1042,7 @@ func (pr *partRun) create(x extracted, sc *takeout.Sidecar, variant, name, key, 
 		groupID = googleID + "#" + takeout.VariantOriginal
 	}
 	it := &store.Item{AccountID: pr.acct.ID, GoogleID: googleID, Variant: variant, IdentityKey: key, IdentitySrc: src, Filename: name,
-		Ext: strings.ToLower(filepath.Ext(name)), TakenAt: taken, TakenSrc: takenSrc, LibPath: libPath, GroupID: groupID}
+		Ext: strings.ToLower(filepath.Ext(name)), TakenAt: taken, TakenSrc: takenSrc, LibPath: libPath, GroupID: groupID, BytesExportID: pr.part.ExportID}
 	err = pr.ing.journaled(ctx, "create", steps, func(tx *store.Store) error {
 		if blob == nil {
 			b, err := tx.InsertBlob(ctx, x.sha, x.size, libPath)
@@ -915,43 +1095,163 @@ func fileSHA(p string) string {
 }
 
 // existing handles another occurrence of a known item: unchanged (just a
-// membership), changed sidecar, or changed bytes (supersede).
+// membership), changed sidecar, or changed bytes (supersede). Parts are not
+// guaranteed to arrive in export order: content from an export older than the
+// one that last supplied the item's bytes or sidecar never replaces them; the
+// bytes are kept as a version and the sidecar is ignored.
 func (pr *partRun) existing(item *store.Item, x extracted, sc *takeout.Sidecar, variant, name string) error {
 	ctx, st := pr.ctx, pr.ing.st
 	blob, err := st.GetBlob(ctx, item.BlobID)
 	if err != nil {
 		return err
 	}
-	changed := false
-	if blob != nil && blob.SHA256 != x.sha {
+	changed, versioned := false, false
+	switch {
+	case blob != nil && blob.SHA256 != x.sha && pr.olderThan(item.BytesExportID):
+		kept, err := pr.keepAsVersion(item, x)
+		if err != nil {
+			return fmt.Errorf("keep version: %w", err)
+		}
+		versioned = kept
+	case blob != nil && blob.SHA256 != x.sha:
 		if err := pr.supersede(item, blob, x); err != nil {
 			return fmt.Errorf("supersede: %w", err)
 		}
 		changed = true
+	case item.BytesExportID == "" || ExportOlder(item.BytesExportID, pr.part.ExportID):
+		// the same bytes, confirmed by a newer export
+		item.BytesExportID = pr.part.ExportID
+		if err := st.UpdateItem(ctx, item); err != nil {
+			return err
+		}
 	}
 	if sc != nil {
-		cur, err := st.GetSidecar(ctx, item.ID)
+		scChanged, err := pr.applySidecar(item, sc, name)
 		if err != nil {
 			return err
 		}
-		if cur == nil || cur.SHA256 != sc.SHA256 {
-			if err := pr.updateSidecar(item, sc, name); err != nil {
-				return fmt.Errorf("sidecar update: %w", err)
-			}
-			changed = true
-		} else if pr.ing.cfg.Layout.KeepSidecarJSON && !exists(pr.ing.abs(sidecarPath(item.LibPath))) {
-			// the file beside the item went missing (or a crashed run never wrote it)
-			if err := pr.writeSidecarFile(item.LibPath, sc); err != nil {
-				return err
-			}
-		}
+		changed = changed || scChanged
 	}
-	if changed {
+	switch {
+	case changed:
 		pr.res.Changed++
-	} else {
+	case versioned:
+		pr.res.Versioned++
+	default:
 		pr.res.Duplicates++
 	}
 	return st.TouchItem(ctx, item.ID)
+}
+
+// olderThan reports whether this part's export is older than exportID (an
+// unknown exportID never counts as newer).
+func (pr *partRun) olderThan(exportID string) bool {
+	return exportID != "" && ExportOlder(pr.part.ExportID, exportID)
+}
+
+// applySidecar stores a sidecar for an item unless the stored one came from a
+// newer export. It reports whether the stored sidecar changed.
+func (pr *partRun) applySidecar(item *store.Item, sc *takeout.Sidecar, name string) (bool, error) {
+	ctx, st := pr.ctx, pr.ing.st
+	cur, err := st.GetSidecar(ctx, item.ID)
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case cur != nil && cur.SHA256 == sc.SHA256:
+		if cur.ExportID == "" || ExportOlder(cur.ExportID, pr.part.ExportID) {
+			partNo := pr.part.PartNo
+			if sc.SourcePart != 0 {
+				partNo = sc.SourcePart
+			}
+			if err := st.SetSidecarExport(ctx, item.ID, pr.part.ExportID, partNo); err != nil {
+				return false, err
+			}
+		}
+	case cur != nil && pr.olderThan(cur.ExportID):
+		// an older export's view of the metadata; the newer one stays
+		pr.ing.log.Debug("ignoring sidecar from an older export", "item", item.LibPath, "export", pr.part.ExportID, "kept", cur.ExportID)
+		sc = &takeout.Sidecar{Raw: cur.JSON}
+	default:
+		if err := pr.updateSidecar(item, sc, name); err != nil {
+			return false, fmt.Errorf("sidecar update: %w", err)
+		}
+		return true, nil
+	}
+	if pr.ing.cfg.Layout.KeepSidecarJSON && !exists(pr.ing.abs(sidecarPath(item.LibPath))) {
+		// the file beside the item went missing (or a crashed run never wrote it)
+		if err := pr.writeSidecarFile(item.LibPath, sc); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// keepAsVersion stores bytes that differ from an item's current content
+// without replacing it: they come from an export older than the one that
+// supplied the current bytes. The version path is a function of the content so
+// that a retry after a crash finds the same file. It reports whether a new
+// version was recorded.
+func (pr *partRun) keepAsVersion(item *store.Item, x extracted) (bool, error) {
+	ctx, st := pr.ctx, pr.ing.st
+	blob, err := st.FindBlob(ctx, x.sha)
+	if err != nil {
+		return false, err
+	}
+	if blob != nil {
+		versions, err := st.VersionsByItem(ctx, item.ID)
+		if err != nil {
+			return false, err
+		}
+		for _, v := range versions {
+			if v.BlobID == blob.ID && exists(pr.ing.abs(v.Path)) {
+				return false, nil // these bytes are already kept for this item
+			}
+		}
+	}
+	verPath := suffixed(item.LibPath, "v"+x.sha[:8])
+	prev, err := st.VersionByPath(ctx, verPath)
+	if err != nil {
+		return false, err
+	}
+	if prev != nil && (prev.ItemID != item.ID || blob == nil || prev.BlobID != blob.ID) {
+		return false, fmt.Errorf("version path %s belongs to another item or content", verPath)
+	}
+	placed := false // a crashed earlier attempt already put the bytes there
+	if exists(pr.ing.abs(verPath)) {
+		if fileSHA(pr.ing.abs(verPath)) != x.sha {
+			return false, fmt.Errorf("version path %s exists with unexpected content", verPath)
+		}
+		placed = true
+	}
+	var steps []Step
+	switch {
+	case placed:
+		steps = []Step{{Op: "unlink", Dst: x.tmpRel}}
+	case blob != nil && exists(pr.ing.abs(blob.CanonicalPath)):
+		steps = []Step{{Op: "link", Src: blob.CanonicalPath, Dst: verPath}, {Op: "unlink", Dst: x.tmpRel}}
+	default:
+		steps = []Step{{Op: "rename", Src: x.tmpRel, Dst: verPath}}
+	}
+	pr.ing.log.Info("older export carries other bytes, kept as a version", "item", item.LibPath, "version", verPath, "export", pr.part.ExportID, "current", item.BytesExportID)
+	err = pr.ing.journaled(ctx, "keep-version", steps, func(tx *store.Store) error {
+		if blob == nil {
+			b, err := tx.InsertBlob(ctx, x.sha, x.size, verPath)
+			if err != nil {
+				return err
+			}
+			blob = b
+		} else if !exists(pr.ing.abs(blob.CanonicalPath)) {
+			if err := tx.SetBlobCanonical(ctx, blob.ID, verPath); err != nil {
+				return err
+			}
+		}
+		if prev == nil {
+			return tx.InsertVersion(ctx, item.ID, blob.ID, verPath, pr.part.ExportID)
+		}
+		return nil
+	})
+	return err == nil, err
 }
 
 func (pr *partRun) supersede(item *store.Item, oldBlob *store.Blob, x extracted) error {
@@ -999,11 +1299,15 @@ func (pr *partRun) supersede(item *store.Item, oldBlob *store.Blob, x extracted)
 	}
 	switch {
 	case newPlaced:
-		steps = append(steps, Step{Op: "unlink", Dst: x.tmpRel})
 	case newBlob != nil && exists(pr.ing.abs(newBlob.CanonicalPath)):
-		steps = append(steps, Step{Op: "link", Src: newBlob.CanonicalPath, Dst: item.LibPath}, Step{Op: "unlink", Dst: x.tmpRel})
+		steps = append(steps, Step{Op: "link", Src: newBlob.CanonicalPath, Dst: item.LibPath})
+	case x.tmpRel == "":
+		return fmt.Errorf("no file holds the new bytes %s", x.sha[:8])
 	default:
 		steps = append(steps, Step{Op: "rename", Src: x.tmpRel, Dst: item.LibPath})
+	}
+	if x.tmpRel != "" && (newPlaced || (newBlob != nil && exists(pr.ing.abs(newBlob.CanonicalPath)))) {
+		steps = append(steps, Step{Op: "unlink", Dst: x.tmpRel}) // the rename case consumes it
 	}
 	for _, ai := range ais {
 		steps = append(steps, Step{Op: "unlink", Dst: ai.LinkPath}, pr.linkStep(item.LibPath, ai.LinkPath))
@@ -1031,7 +1335,10 @@ func (pr *partRun) supersede(item *store.Item, oldBlob *store.Blob, x extracted)
 				return err
 			}
 		}
-		item.BlobID = newBlob.ID
+		item.BlobID, item.BytesExportID = newBlob.ID, pr.part.ExportID
+		if x.exportID != "" {
+			item.BytesExportID = x.exportID
+		}
 		return tx.UpdateItem(ctx, item)
 	})
 }
@@ -1044,10 +1351,14 @@ func (pr *partRun) updateSidecar(item *store.Item, sc *takeout.Sidecar, name str
 	if t, ok := sc.Taken(); ok {
 		taken, takenSrc = t, "sidecar"
 	}
+	blob, err := st.GetBlob(ctx, item.BlobID)
+	if err != nil {
+		return err
+	}
 	newPath := item.LibPath
 	if name != item.Filename || !taken.Equal(item.TakenAt) {
 		dir := pr.libraryDir(taken, takenSrc)
-		p, _, err := pr.libraryPath(dir, name, item.IdentityKey, item.ID, "", 0)
+		p, err := pr.movePath(item, blob, dir, name, item.IdentityKey)
 		if err != nil {
 			return err
 		}
@@ -1055,17 +1366,14 @@ func (pr *partRun) updateSidecar(item *store.Item, sc *takeout.Sidecar, name str
 	}
 	var steps []Step
 	oldPath := item.LibPath
+	var movedLinks []*store.AlbumItem
 	if newPath != oldPath {
 		steps = append(steps, Step{Op: "rename", Src: oldPath, Dst: newPath}, Step{Op: "unlink", Dst: sidecarPath(oldPath)})
-		more, err := pr.symlinkMoveSteps(item, newPath)
+		more, moved, err := pr.linkMoveSteps(item, newPath)
 		if err != nil {
 			return err
 		}
-		steps = append(steps, more...)
-	}
-	blob, err := st.GetBlob(ctx, item.BlobID)
-	if err != nil {
-		return err
+		steps, movedLinks = append(steps, more...), moved
 	}
 	err = pr.ing.journaled(ctx, "sidecar", steps, func(tx *store.Store) error {
 		item.Filename, item.TakenAt, item.TakenSrc, item.LibPath = name, taken, takenSrc, newPath
@@ -1077,6 +1385,11 @@ func (pr *partRun) updateSidecar(item *store.Item, sc *takeout.Sidecar, name str
 		if err := tx.UpdateItem(ctx, item); err != nil {
 			return err
 		}
+		for _, ai := range movedLinks {
+			if err := tx.UpsertAlbumItem(ctx, ai); err != nil {
+				return err
+			}
+		}
 		return pr.saveSidecar(tx, item.ID, sc)
 	})
 	if err != nil {
@@ -1087,39 +1400,98 @@ func (pr *partRun) updateSidecar(item *store.Item, sc *takeout.Sidecar, name str
 
 // ---- promotion and merge ---------------------------------------------------
 
-// promoteFromEarlierParts promotes fallback items whose media was ingested
-// from an earlier part of this export and whose sidecar arrived now.
-func (pr *partRun) promoteFromEarlierParts(fc *folderCtx) error {
+// applyLateSidecars applies sidecars that arrive after their media was
+// committed: media from an earlier part of this export, or media of this part
+// finished by an earlier run whose sidecar could not be read then. Only items
+// without any stored sidecar are touched (fallback or not), so the index's
+// fuzzy rules (title, stem prefix) can never replace metadata or an identity
+// that an exact match supplied.
+func (pr *partRun) applyLateSidecars(fc *folderCtx, doneMedia, prevFailed map[string]bool) error {
 	ctx, st := pr.ctx, pr.ing.st
 	occs, err := st.OccurrencesInFolder(ctx, pr.acct.ID, pr.part.ExportID, fc.name)
 	if err != nil {
 		return err
 	}
 	for _, o := range occs {
-		if o.ItemID == 0 || o.PartNo == pr.part.PartNo {
+		if o.ItemID == 0 || !o.Active {
 			continue
 		}
-		// the lookup also marks the sidecar used, so a re-run never stores it as pending
-		m, ok := fc.index.Lookup(o.EntryName)
+		if o.PartNo == pr.part.PartNo && !doneMedia[fc.name+"/"+o.EntryName] {
+			continue // pass B commits this entry together with its sidecar
+		}
+		item, err := st.GetItem(ctx, o.ItemID)
+		if err != nil || item == nil {
+			continue
+		}
+		cur, err := st.GetSidecar(ctx, item.ID)
+		if err != nil {
+			return err
+		}
+		var m takeout.Match
+		var ok bool
+		switch {
+		case cur == nil:
+			// the lookup also marks the sidecar used, so a re-run never stores it as pending
+			m, ok = fc.index.Lookup(o.EntryName)
+		case cur.ExportID == pr.part.ExportID && cur.PartNo == pr.part.PartNo && o.PartNo != pr.part.PartNo:
+			// this part supplied the stored sidecar of media that lives in another
+			// part; ingested again (a replacement), an exact sidecar may correct it
+			if m, ok = fc.index.Exact(o.EntryName); ok && m.Sidecar.SHA256 == cur.SHA256 {
+				ok = false
+			}
+		}
 		if !ok {
 			continue
 		}
-		item, err := st.GetItem(ctx, o.ItemID)
-		if err != nil || item == nil || item.IdentitySrc != store.IdentityFallback {
-			continue
-		}
-		gid := m.Sidecar.GoogleID()
-		if gid == "" {
-			continue
-		}
 		entry := "promotion:" + fc.name + "/" + o.EntryName
-		if _, err := pr.promote(item, m.Sidecar, m.Variant, gid, gid+"#"+m.Variant); err != nil {
-			pr.failNamed(entry, fmt.Errorf("late promotion: %w", err))
+		acted, err := pr.applyLateSidecar(item, o, m)
+		if err != nil {
+			pr.failNamed(entry, fmt.Errorf("late sidecar: %w", err))
 			continue
 		}
-		_ = st.MarkEntry(ctx, pr.arch.ID, entry, store.EntryDone, 0, "")
+		if acted || prevFailed[entry] {
+			_ = st.MarkEntry(ctx, pr.arch.ID, entry, store.EntryDone, 0, "")
+		}
 	}
 	return nil
+}
+
+// applyLateSidecar gives a fallback item the identity its sidecar carries,
+// stores the sidecar for an item that has none, or applies a corrected exact
+// sidecar from the part that supplied the stored one (re-keying the item when
+// the Google id changed). It reports whether it changed anything.
+func (pr *partRun) applyLateSidecar(item *store.Item, o *store.Occurrence, m takeout.Match) (bool, error) {
+	ctx, st := pr.ctx, pr.ing.st
+	if gid := m.Sidecar.GoogleID(); gid != "" && (item.IdentitySrc == store.IdentityFallback || item.GoogleID != gid) {
+		variant, key := m.Variant, gid+"#"+m.Variant
+		if variant == takeout.VariantOriginal {
+			// a second file sharing the still's Google id (e.g. a Live Photo video
+			// with a sidecar of its own) is an alt variant, not a duplicate to merge
+			other, err := st.FindItemByKey(ctx, pr.acct.ID, key)
+			if err != nil {
+				return false, err
+			}
+			if other != nil && other.ID != item.ID && !strings.EqualFold(other.Ext, item.Ext) {
+				variant = "alt:" + strings.ToLower(strings.TrimPrefix(item.Ext, "."))
+				key = gid + "#" + variant
+			}
+		}
+		if _, err := pr.promote(item, m.Sidecar, variant, gid, key); err != nil {
+			return false, fmt.Errorf("promotion: %w", err)
+		}
+		return true, nil
+	}
+	cur, err := st.GetSidecar(ctx, item.ID)
+	if err != nil {
+		return false, err
+	}
+	if cur != nil && cur.SHA256 == m.Sidecar.SHA256 {
+		return false, nil
+	}
+	if err := pr.updateSidecar(item, m.Sidecar, deriveName(o.EntryName, m.Sidecar, item.Variant)); err != nil {
+		return false, fmt.Errorf("sidecar update: %w", err)
+	}
+	return true, nil
 }
 
 // promote gives a fallback item its Google identity, or merges it into the
@@ -1129,33 +1501,31 @@ func (pr *partRun) promote(fb *store.Item, sc *takeout.Sidecar, variant, googleI
 	if target, err := st.FindItemByKey(ctx, pr.acct.ID, newKey); err != nil {
 		return nil, err
 	} else if target != nil {
-		if err := pr.merge(fb, target); err != nil {
-			return nil, fmt.Errorf("merge: %w", err)
-		}
-		return st.GetItem(ctx, target.ID)
+		return pr.mergeInto(fb, target, sc, variant)
 	}
 	name := deriveName(fb.Filename, sc, variant)
 	taken, takenSrc := fb.TakenAt, fb.TakenSrc
 	if t, ok := sc.Taken(); ok {
 		taken, takenSrc = t, "sidecar"
 	}
+	blob, err := st.GetBlob(ctx, fb.BlobID)
+	if err != nil {
+		return nil, err
+	}
 	oldPath := fb.LibPath
-	newPath, _, err := pr.libraryPath(pr.libraryDir(taken, takenSrc), name, newKey, fb.ID, "", 0)
+	newPath, err := pr.movePath(fb, blob, pr.libraryDir(taken, takenSrc), name, newKey)
 	if err != nil {
 		return nil, err
 	}
 	var steps []Step
+	var movedLinks []*store.AlbumItem
 	if newPath != oldPath {
 		steps = append(steps, Step{Op: "rename", Src: oldPath, Dst: newPath}, Step{Op: "unlink", Dst: sidecarPath(oldPath)})
-		more, err := pr.symlinkMoveSteps(fb, newPath)
+		more, moved, err := pr.linkMoveSteps(fb, newPath)
 		if err != nil {
 			return nil, err
 		}
-		steps = append(steps, more...)
-	}
-	blob, err := st.GetBlob(ctx, fb.BlobID)
-	if err != nil {
-		return nil, err
+		steps, movedLinks = append(steps, more...), moved
 	}
 	err = pr.ing.journaled(ctx, "promote", steps, func(tx *store.Store) error {
 		fb.GoogleID, fb.Variant, fb.IdentityKey, fb.IdentitySrc = googleID, variant, newKey, store.IdentityGoogle
@@ -1168,6 +1538,11 @@ func (pr *partRun) promote(fb *store.Item, sc *takeout.Sidecar, variant, googleI
 		}
 		if err := tx.UpdateItem(ctx, fb); err != nil {
 			return err
+		}
+		for _, ai := range movedLinks {
+			if err := tx.UpsertAlbumItem(ctx, ai); err != nil {
+				return err
+			}
 		}
 		if err := tx.MoveOccurrences(ctx, fb.ID, fb.ID); err != nil {
 			return err
@@ -1183,6 +1558,59 @@ func (pr *partRun) promote(fb *store.Item, sc *takeout.Sidecar, variant, googleI
 	pr.res.Promoted++
 	pr.ing.log.Info("promoted fallback item", "path", newPath, "google_id", googleID)
 	return fb, pr.ensureGroupLinks(fb)
+}
+
+// mergeInto folds a fallback item into the item that owns its identity. The
+// fallback's bytes and the arriving sidecar are first applied to the target
+// under the usual export-order rule, so that a newer export's content seen
+// before its sidecar becomes current rather than a mere kept version. Each
+// step is journaled on its own; a crash between them leaves the fallback item
+// in place and the next run repeats the remaining steps.
+func (pr *partRun) mergeInto(fb, target *store.Item, sc *takeout.Sidecar, variant string) (*store.Item, error) {
+	ctx, st := pr.ctx, pr.ing.st
+	fbBlob, err := st.GetBlob(ctx, fb.BlobID)
+	if err != nil {
+		return nil, err
+	}
+	tBlob, err := st.GetBlob(ctx, target.BlobID)
+	if err != nil {
+		return nil, err
+	}
+	fbExport := fb.BytesExportID
+	if fbExport == "" {
+		fbExport = pr.part.ExportID
+	}
+	fbNewer := target.BytesExportID == "" || ExportOlder(target.BytesExportID, fbExport)
+	switch {
+	case fbBlob == nil || tBlob == nil:
+	case fbBlob.SHA256 != tBlob.SHA256 && (fbNewer || fbExport == target.BytesExportID):
+		// the fallback carries newer bytes: they become current (hardlinked from
+		// the fallback's file), the target's bytes become a kept version
+		x := extracted{sha: fbBlob.SHA256, size: fbBlob.Size, exportID: fbExport}
+		if err := pr.supersede(target, tBlob, x); err != nil {
+			return nil, fmt.Errorf("supersede: %w", err)
+		}
+		pr.res.Changed++
+	case fbBlob.SHA256 == tBlob.SHA256 && fbNewer:
+		// the same bytes confirmed by a newer export: an export in between may
+		// no longer replace them
+		target.BytesExportID = fbExport
+		if err := st.UpdateItem(ctx, target); err != nil {
+			return nil, err
+		}
+	}
+	if sc != nil {
+		if _, err := pr.applySidecar(target, sc, deriveName(fb.Filename, sc, variant)); err != nil {
+			return nil, err
+		}
+	}
+	if target, err = st.GetItem(ctx, target.ID); err != nil || target == nil {
+		return nil, fmt.Errorf("target item %d vanished: %v", fb.ID, err)
+	}
+	if err := pr.merge(fb, target); err != nil {
+		return nil, fmt.Errorf("merge: %w", err)
+	}
+	return st.GetItem(ctx, target.ID)
 }
 
 // merge folds a fallback item into the item that owns the identity.
@@ -1293,7 +1721,10 @@ func (pr *partRun) merge(fb, target *store.Item) error {
 		if newest == "" {
 			continue
 		}
-		if err := pr.ensureDirectConfirmed(a, target, newest); err != nil {
+		if _, err := pr.ensureDirectConfirmed(a, target, newest); err != nil {
+			return err
+		}
+		if err := pr.retireOccurrences(a, target); err != nil {
 			return err
 		}
 	}
@@ -1463,8 +1894,31 @@ func (pr *partRun) albumPathExcept(title, date, folder string, exceptID int64) (
 }
 
 func (pr *partRun) linkPathFor(album *store.Album, item *store.Item) (string, error) {
-	base := path.Base(item.LibPath)
+	return pr.linkPathForName(album, item, path.Base(item.LibPath), item.LibPath)
+}
+
+// linkPathForName returns the link path for an item under a given file name.
+// A path already occupied is the item's own when it shares the inode (or, in
+// copy mode, the bytes) of one of the item's library paths.
+func (pr *partRun) linkPathForName(album *store.Album, item *store.Item, base string, libPaths ...string) (string, error) {
 	cands := []string{path.Join(album.Path, base), path.Join(album.Path, suffixed(base, hash8(item.IdentityKey)))}
+	own := func(p string) bool {
+		for _, lp := range libPaths {
+			if !exists(pr.ing.abs(lp)) {
+				continue
+			}
+			if fsops.SameInode(pr.ing.abs(p), pr.ing.abs(lp)) {
+				return true
+			}
+			// in copy mode a crashed run may have left the finished copy behind: reuse it
+			if pr.ing.cfg.Layout.LinkMode == "copy" {
+				if same, err := fsops.SameContent(pr.ing.abs(p), pr.ing.abs(lp)); err == nil && same {
+					return true
+				}
+			}
+		}
+		return false
+	}
 	for _, p := range cands {
 		taken, err := pr.ing.st.LinkPathTaken(pr.ctx, p, album.ID, item.ID)
 		if err != nil {
@@ -1473,13 +1927,7 @@ func (pr *partRun) linkPathFor(album *store.Album, item *store.Item) (string, er
 		if taken {
 			continue
 		}
-		if exists(pr.ing.abs(p)) && !fsops.SameInode(pr.ing.abs(p), pr.ing.abs(item.LibPath)) {
-			// in copy mode a crashed run may have left the finished copy behind: reuse it
-			if pr.ing.cfg.Layout.LinkMode == "copy" {
-				if same, err := fsops.SameContent(pr.ing.abs(p), pr.ing.abs(item.LibPath)); err == nil && same {
-					return p, nil
-				}
-			}
+		if exists(pr.ing.abs(p)) && !own(p) {
 			continue
 		}
 		return p, nil
@@ -1488,24 +1936,34 @@ func (pr *partRun) linkPathFor(album *store.Album, item *store.Item) (string, er
 }
 
 // ensureDirect makes item a direct member of album and propagates group links.
-func (pr *partRun) ensureDirect(album *store.Album, item *store.Item) error {
+func (pr *partRun) ensureDirect(album *store.Album, item *store.Item) (bool, error) {
 	return pr.ensureDirectConfirmed(album, item, pr.part.ExportID)
 }
 
 // ensureDirectConfirmed is ensureDirect with an explicit confirming export id.
-func (pr *partRun) ensureDirectConfirmed(album *store.Album, item *store.Item, exportID string) error {
+func (pr *partRun) ensureDirectConfirmed(album *store.Album, item *store.Item, exportID string) (linked bool, err error) {
 	ctx, st := pr.ctx, pr.ing.st
 	ai, err := st.GetAlbumItem(ctx, album.ID, item.ID)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if ai == nil || !ai.Direct {
+		// a complete listing newer than this export was applied (to the album, or
+		// to the account before this album existed) and does not contain the
+		// item (no row, or only a link derived from its still): this occurrence
+		// is history, not a direct membership
+		if applied, err := pr.appliedListing(album); err != nil {
+			return false, err
+		} else if applied != "" && ExportOlder(exportID, applied) {
+			pr.ing.log.Debug("membership from an older export superseded by a newer listing", "album", album.Path, "item", item.LibPath, "export", exportID, "listing", applied)
+			return false, nil
+		}
 	}
 	linkPath := ""
 	if ai != nil {
 		linkPath = ai.LinkPath
-	} else {
-		if linkPath, err = pr.linkPathFor(album, item); err != nil {
-			return err
-		}
+	} else if linkPath, err = pr.linkPathFor(album, item); err != nil {
+		return false, err
 	}
 	row := &store.AlbumItem{AlbumID: album.ID, ItemID: item.ID, LinkPath: linkPath, Direct: true, ConfirmedExportID: exportID, ConfirmedBy: pr.part.Name}
 	if ai != nil {
@@ -1519,27 +1977,27 @@ func (pr *partRun) ensureDirectConfirmed(album *store.Album, item *store.Item, e
 		steps = []Step{pr.linkStep(item.LibPath, linkPath)}
 	}
 	if err := pr.ing.journaled(ctx, "album-link", steps, func(tx *store.Store) error { return tx.UpsertAlbumItem(ctx, row) }); err != nil {
-		return err
+		return false, err
 	}
 	if ai == nil || !ai.Direct {
 		pr.res.Links++
 	}
 	if item.IdentityKey != item.GroupID {
-		return nil // only the original still carries its companions into an album
+		return true, nil // only the original still carries its companions into an album
 	}
 	members, err := st.ItemsByGroup(ctx, pr.acct.ID, item.GroupID)
 	if err != nil {
-		return err
+		return true, err
 	}
 	for _, m := range members {
 		if m.ID == item.ID {
 			continue
 		}
 		if err := pr.ensureViaGroup(album, m, item); err != nil {
-			return err
+			return true, err
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // ensureViaGroup links a companion into an album its still is a direct member of.

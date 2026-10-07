@@ -163,6 +163,27 @@ func (ix *Index) Lookup(mediaBase string) (Match, bool) {
 	return Match{}, false
 }
 
+// Exact returns the sidecar registered under the media name itself (or, for
+// an edited file, under its original's name), marking it used; it never uses
+// the title or stem heuristics.
+func (ix *Index) Exact(mediaBase string) (Match, bool) {
+	lb := strings.ToLower(mediaBase)
+	if e, ok := ix.exact[lb]; ok {
+		ix.used[e.sc] = true
+		if orig, edited := IsEdited(mediaBase); edited {
+			return Match{Sidecar: e.sc, Variant: VariantEdited, Still: orig, Key: e.key}, true
+		}
+		return Match{Sidecar: e.sc, Variant: VariantOriginal, Still: mediaBase, Key: e.key}, true
+	}
+	if orig, edited := IsEdited(mediaBase); edited {
+		if e, ok := ix.exact[strings.ToLower(orig)]; ok {
+			ix.used[e.sc] = true
+			return Match{Sidecar: e.sc, Variant: VariantEdited, Still: orig, Key: e.key}, true
+		}
+	}
+	return Match{}, false
+}
+
 // CompanionStills lists the still-image names a companion file could belong to.
 func CompanionStills(mediaBase string) []string {
 	root, ext := SplitExt(mediaBase)

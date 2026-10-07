@@ -60,8 +60,11 @@ type Sidecar struct {
 	Archived       bool     `json:"archived"`
 	Trashed        bool     `json:"trashed"`
 
-	Raw    []byte `json:"-"` // the exact bytes as exported
-	SHA256 string `json:"-"` // hash of Raw
+	Raw []byte `json:"-"` // the exact bytes as exported
+	// SourcePart is the part that carried this sidecar when it came from the
+	// pending store (0 when it is in the part being ingested).
+	SourcePart int    `json:"-"`
+	SHA256     string `json:"-"` // hash of Raw
 }
 
 // ParseSidecar parses a sidecar; unknown fields are kept in Raw only.

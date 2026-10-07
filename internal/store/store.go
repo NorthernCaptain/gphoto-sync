@@ -197,20 +197,21 @@ func (s *Store) CountExports(ctx context.Context, accountID int64) (int, error) 
 
 // Archive is one part of an export.
 type Archive struct {
-	ID         int64
-	AccountID  int64
-	RemoteID   string
-	Name       string
-	ExportID   string
-	PartNo     int
-	Size       int64
-	MD5        string
-	Status     string
-	LocalPath  string
-	Entries    int
-	Ingested   int
-	Duplicates int
-	Errors     int
+	ID              int64
+	AccountID       int64
+	RemoteID        string
+	Name            string
+	ExportID        string
+	PartNo          int
+	Size            int64
+	MD5             string
+	Status          string
+	LocalPath       string
+	RemoteDeletedAt string // when the Drive copy was confirmed deleted ("" while still owed)
+	Entries         int
+	Ingested        int
+	Duplicates      int
+	Errors          int
 }
 
 // Archive statuses.
@@ -229,8 +230,13 @@ func (s *Store) UpsertArchive(ctx context.Context, a *Archive) (*Archive, error)
 	_, err := s.q.ExecContext(ctx, `INSERT INTO archives(account_id, remote_id, name, export_id, part_no, size, md5, status, local_path, started_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(account_id, export_id, part_no) DO UPDATE SET
+		  -- a row written for a listed Drive file (remote_id given) records that file exactly:
+		  -- its size and hash as listed (the hash may be unknown), and its deletion still owed;
+		  -- a local ingest (no remote_id) keeps what is known
+		  remote_deleted_at = CASE WHEN excluded.remote_id IS NOT NULL THEN NULL ELSE remote_deleted_at END,
+		  size = CASE WHEN excluded.remote_id IS NOT NULL THEN excluded.size ELSE COALESCE(excluded.size, size) END,
+		  md5 = CASE WHEN excluded.remote_id IS NOT NULL THEN excluded.md5 ELSE COALESCE(excluded.md5, md5) END,
 		  remote_id = COALESCE(excluded.remote_id, remote_id), name = excluded.name,
-		  size = COALESCE(excluded.size, size), md5 = COALESCE(excluded.md5, md5),
 		  status = excluded.status, local_path = COALESCE(excluded.local_path, local_path),
 		  started_at = COALESCE(started_at, excluded.started_at)`,
 		a.AccountID, nullStr(a.RemoteID), a.Name, a.ExportID, a.PartNo, nullInt(a.Size), nullStr(a.MD5), a.Status, nullStr(a.LocalPath), Now())
@@ -240,16 +246,16 @@ func (s *Store) UpsertArchive(ctx context.Context, a *Archive) (*Archive, error)
 	return s.GetArchive(ctx, a.AccountID, a.ExportID, a.PartNo)
 }
 
-const archiveCols = `id, account_id, remote_id, name, export_id, part_no, size, md5, status, local_path, entries, ingested, duplicates, errors`
+const archiveCols = `id, account_id, remote_id, name, export_id, part_no, size, md5, status, local_path, remote_deleted_at, entries, ingested, duplicates, errors`
 
 func scanArchive(sc interface{ Scan(...any) error }) (*Archive, error) {
 	var a Archive
-	var remote, md5, local sql.NullString
+	var remote, md5, local, deleted sql.NullString
 	var size sql.NullInt64
-	if err := sc.Scan(&a.ID, &a.AccountID, &remote, &a.Name, &a.ExportID, &a.PartNo, &size, &md5, &a.Status, &local, &a.Entries, &a.Ingested, &a.Duplicates, &a.Errors); err != nil {
+	if err := sc.Scan(&a.ID, &a.AccountID, &remote, &a.Name, &a.ExportID, &a.PartNo, &size, &md5, &a.Status, &local, &deleted, &a.Entries, &a.Ingested, &a.Duplicates, &a.Errors); err != nil {
 		return nil, err
 	}
-	a.RemoteID, a.MD5, a.LocalPath, a.Size = remote.String, md5.String, local.String, size.Int64
+	a.RemoteID, a.MD5, a.LocalPath, a.Size, a.RemoteDeletedAt = remote.String, md5.String, local.String, size.Int64, deleted.String
 	return &a, nil
 }
 
@@ -262,13 +268,35 @@ func (s *Store) GetArchive(ctx context.Context, accountID int64, exportID string
 	return a, err
 }
 
-// GetArchiveByRemoteID returns an archive row by Drive file id or nil.
-func (s *Store) GetArchiveByRemoteID(ctx context.Context, remoteID string) (*Archive, error) {
+// GetArchiveByRemoteID returns an account's archive row for a Drive file id,
+// or nil. Another account's row for the same id is never this account's ingest.
+func (s *Store) GetArchiveByRemoteID(ctx context.Context, accountID int64, remoteID string) (*Archive, error) {
+	a, err := scanArchive(s.q.QueryRowContext(ctx, `SELECT `+archiveCols+` FROM archives WHERE account_id = ? AND remote_id = ?`, accountID, remoteID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return a, err
+}
+
+// ArchiveByRemoteIDAnyAccount returns whichever account's archive row records
+// a Drive file id (remote ids are unique across the table), or nil.
+func (s *Store) ArchiveByRemoteIDAnyAccount(ctx context.Context, remoteID string) (*Archive, error) {
 	a, err := scanArchive(s.q.QueryRowContext(ctx, `SELECT `+archiveCols+` FROM archives WHERE remote_id = ?`, remoteID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	return a, err
+}
+
+// NewestPrunedExport returns the newest export whose complete album listing
+// was applied to the account ("" if none).
+func (s *Store) NewestPrunedExport(ctx context.Context, accountID int64) (string, error) {
+	var v string
+	err := s.q.QueryRowContext(ctx, `SELECT export_id FROM exports WHERE account_id = ? AND albums_pruned_at IS NOT NULL ORDER BY `+exportOrderDesc+` LIMIT 1`, accountID).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return v, err
 }
 
 // ListArchives returns an account's archives ordered by export and part.
@@ -300,6 +328,90 @@ func (s *Store) FinishArchive(ctx context.Context, id int64, status string, entr
 func (s *Store) SetArchiveStatus(ctx context.Context, id int64, status, localPath string) error {
 	_, err := s.q.ExecContext(ctx, `UPDATE archives SET status = ?, local_path = COALESCE(?, local_path) WHERE id = ?`, status, nullStr(localPath), id)
 	return err
+}
+
+// SetArchiveRemote records the Drive file an already ingested part was
+// matched to by content (a re-upload with a new id).
+func (s *Store) SetArchiveRemote(ctx context.Context, id int64, remoteID string, size int64, md5 string) error {
+	_, err := s.q.ExecContext(ctx, `UPDATE archives SET remote_id = ?, size = COALESCE(?, size), md5 = COALESCE(?, md5), remote_deleted_at = NULL WHERE id = ?`,
+		nullStr(remoteID), nullInt(size), nullStr(md5), id)
+	return err
+}
+
+// exportOrderDesc orders export ids (<timestamp>-<sequence>) newest first, by
+// timestamp then numeric sequence, for a column named export_id.
+const exportOrderDesc = `substr(export_id, 1, instr(export_id, '-') - 1) DESC, CAST(substr(export_id, instr(export_id, '-') + 1) AS INTEGER) DESC`
+
+// ForgetArchiveSource drops what an archive row knows about the file it was
+// ingested from (Drive id, hash, size, deletion state): a local replacement of
+// unknown identity must not let a later sync match the old Drive file to it.
+func (s *Store) ForgetArchiveSource(ctx context.Context, id int64) error {
+	_, err := s.q.ExecContext(ctx, `UPDATE archives SET remote_id = NULL, md5 = NULL, size = NULL, remote_deleted_at = NULL WHERE id = ?`, id)
+	return err
+}
+
+// ArchivesAwaitingRemoteDelete lists ingested parts fetched from Drive whose
+// remote copy has not been confirmed deleted.
+func (s *Store) ArchivesAwaitingRemoteDelete(ctx context.Context, accountID int64) ([]*Archive, error) {
+	rows, err := s.q.QueryContext(ctx, `SELECT `+archiveCols+` FROM archives WHERE account_id = ? AND status = ? AND remote_id IS NOT NULL AND remote_deleted_at IS NULL ORDER BY export_id, part_no`, accountID, ArchiveIngested)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Archive
+	for rows.Next() {
+		a, err := scanArchive(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ResetPartForReingest prepares a part whose file on Drive changed to be
+// ingested from scratch: the per-entry bookkeeping and the sidecars it stored
+// for other parts are dropped, the part's
+// occurrences are deactivated (the re-ingest reactivates those still present),
+// album memberships confirmed only by this export's vanished occurrences fall
+// back to the newest remaining evidence, and the export's album listing
+// becomes eligible for pruning again. Direct memberships left without any
+// active occurrence are removed by the ingest once the part is complete
+// (Ingester.ReconcileMemberships).
+func (s *Store) ResetPartForReingest(ctx context.Context, archiveID, accountID int64, exportID string, partNo int) error {
+	return s.Tx(ctx, func(tx *Store) error {
+		q := tx.q
+		if _, err := q.ExecContext(ctx, `DELETE FROM archive_entries WHERE archive_id = ?`, archiveID); err != nil {
+			return err
+		}
+		// state 'reset' marks them as waiting for the replacement: the re-ingest
+		// overwrites the state of those still present, ClearResetState the rest
+		if _, err := q.ExecContext(ctx, `UPDATE occurrences SET active = 0, state = ? WHERE account_id = ? AND export_id = ? AND part_no = ?`, OccReset, accountID, exportID, partNo); err != nil {
+			return err
+		}
+		// sidecars this part stored for media in other parts: the replacement
+		// stores its own again. Rows from before migration 0003 whose source part
+		// could not be backfilled (NULL) may be this part's, so they go too: a
+		// stale sidecar handing its identity to the wrong media is worse than a
+		// sidecar missing until a later export resends it.
+		if _, err := q.ExecContext(ctx, `DELETE FROM pending_sidecars WHERE account_id = ? AND export_id = ? AND (part_no = ? OR part_no IS NULL)`, accountID, exportID, partNo); err != nil {
+			return err
+		}
+		if _, err := q.ExecContext(ctx, `UPDATE album_items SET confirmed_export_id = (
+				SELECT o.export_id FROM occurrences o WHERE o.album_id = album_items.album_id AND o.item_id = album_items.item_id AND o.active = 1
+				ORDER BY `+exportOrderDesc+` LIMIT 1)
+			WHERE confirmed_export_id = ?
+			  AND album_id IN (SELECT id FROM albums WHERE account_id = ?)
+			  AND NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.album_id = album_items.album_id AND o.item_id = album_items.item_id
+			                  AND o.export_id = ? AND o.active = 1)`, exportID, accountID, exportID); err != nil {
+			return err
+		}
+		if _, err := q.ExecContext(ctx, `DELETE FROM albums_full WHERE listing_export_id = ? AND album_id IN (SELECT id FROM albums WHERE account_id = ?)`, exportID, accountID); err != nil {
+			return err
+		}
+		_, err := q.ExecContext(ctx, `UPDATE exports SET albums_pruned_at = NULL WHERE account_id = ? AND export_id = ?`, accountID, exportID)
+		return err
+	})
 }
 
 // SetArchiveRemoteDeleted records a successful remote deletion.
@@ -541,6 +653,7 @@ type Item struct {
 	LibPath          string
 	GroupID          string
 	ArchivedExportID string
+	BytesExportID    string // export that last supplied the bytes at lib_path
 	FirstSeen        string
 	LastSeen         string
 }
@@ -551,16 +664,16 @@ const (
 	IdentityFallback = "fallback"
 )
 
-const itemCols = `id, account_id, blob_id, google_id, variant, identity_key, identity_src, filename, ext, mime, width, height, taken_at, taken_src, lib_path, group_id, archived_export_id, first_seen, last_seen`
+const itemCols = `id, account_id, blob_id, google_id, variant, identity_key, identity_src, filename, ext, mime, width, height, taken_at, taken_src, lib_path, group_id, archived_export_id, bytes_export_id, first_seen, last_seen`
 
 func scanItem(sc interface{ Scan(...any) error }) (*Item, error) {
 	var it Item
-	var gid, mime, taken, takenSrc, archived sql.NullString
+	var gid, mime, taken, takenSrc, archived, bytesExp sql.NullString
 	var w, h sql.NullInt64
-	if err := sc.Scan(&it.ID, &it.AccountID, &it.BlobID, &gid, &it.Variant, &it.IdentityKey, &it.IdentitySrc, &it.Filename, &it.Ext, &mime, &w, &h, &taken, &takenSrc, &it.LibPath, &it.GroupID, &archived, &it.FirstSeen, &it.LastSeen); err != nil {
+	if err := sc.Scan(&it.ID, &it.AccountID, &it.BlobID, &gid, &it.Variant, &it.IdentityKey, &it.IdentitySrc, &it.Filename, &it.Ext, &mime, &w, &h, &taken, &takenSrc, &it.LibPath, &it.GroupID, &archived, &bytesExp, &it.FirstSeen, &it.LastSeen); err != nil {
 		return nil, err
 	}
-	it.GoogleID, it.Mime, it.TakenSrc, it.ArchivedExportID = gid.String, mime.String, takenSrc.String, archived.String
+	it.GoogleID, it.Mime, it.TakenSrc, it.ArchivedExportID, it.BytesExportID = gid.String, mime.String, takenSrc.String, archived.String, bytesExp.String
 	it.Width, it.Height = int(w.Int64), int(h.Int64)
 	it.TakenAt = ParseTime(taken.String)
 	return &it, nil
@@ -625,10 +738,10 @@ func (s *Store) ListItems(ctx context.Context, accountID int64) ([]*Item, error)
 // InsertItem creates an item and returns its id.
 func (s *Store) InsertItem(ctx context.Context, it *Item) (int64, error) {
 	now := Now()
-	res, err := s.q.ExecContext(ctx, `INSERT INTO items(account_id, blob_id, google_id, variant, identity_key, identity_src, filename, ext, mime, width, height, taken_at, taken_src, lib_path, group_id, archived_export_id, first_seen, last_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	res, err := s.q.ExecContext(ctx, `INSERT INTO items(account_id, blob_id, google_id, variant, identity_key, identity_src, filename, ext, mime, width, height, taken_at, taken_src, lib_path, group_id, archived_export_id, bytes_export_id, first_seen, last_seen)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		it.AccountID, it.BlobID, nullStr(it.GoogleID), it.Variant, it.IdentityKey, it.IdentitySrc, it.Filename, it.Ext, nullStr(it.Mime),
-		nullInt(int64(it.Width)), nullInt(int64(it.Height)), nullStr(FormatTime(it.TakenAt)), nullStr(it.TakenSrc), it.LibPath, it.GroupID, nullStr(it.ArchivedExportID), now, now)
+		nullInt(int64(it.Width)), nullInt(int64(it.Height)), nullStr(FormatTime(it.TakenAt)), nullStr(it.TakenSrc), it.LibPath, it.GroupID, nullStr(it.ArchivedExportID), nullStr(it.BytesExportID), now, now)
 	if err != nil {
 		return 0, err
 	}
@@ -638,9 +751,9 @@ func (s *Store) InsertItem(ctx context.Context, it *Item) (int64, error) {
 // UpdateItem rewrites the mutable fields of an item.
 func (s *Store) UpdateItem(ctx context.Context, it *Item) error {
 	_, err := s.q.ExecContext(ctx, `UPDATE items SET blob_id = ?, google_id = ?, variant = ?, identity_key = ?, identity_src = ?, filename = ?, ext = ?, mime = ?,
-		width = ?, height = ?, taken_at = ?, taken_src = ?, lib_path = ?, group_id = ?, archived_export_id = ?, last_seen = ? WHERE id = ?`,
+		width = ?, height = ?, taken_at = ?, taken_src = ?, lib_path = ?, group_id = ?, archived_export_id = ?, bytes_export_id = ?, last_seen = ? WHERE id = ?`,
 		it.BlobID, nullStr(it.GoogleID), it.Variant, it.IdentityKey, it.IdentitySrc, it.Filename, it.Ext, nullStr(it.Mime),
-		nullInt(int64(it.Width)), nullInt(int64(it.Height)), nullStr(FormatTime(it.TakenAt)), nullStr(it.TakenSrc), it.LibPath, it.GroupID, nullStr(it.ArchivedExportID), Now(), it.ID)
+		nullInt(int64(it.Width)), nullInt(int64(it.Height)), nullStr(FormatTime(it.TakenAt)), nullStr(it.TakenSrc), it.LibPath, it.GroupID, nullStr(it.ArchivedExportID), nullStr(it.BytesExportID), Now(), it.ID)
 	return err
 }
 
@@ -683,31 +796,42 @@ func (s *Store) InsertVersion(ctx context.Context, itemID, blobID int64, path, e
 
 // SidecarRow is the stored sidecar of an item.
 type SidecarRow struct {
-	ItemID int64
-	JSON   []byte
-	SHA256 string
+	ItemID   int64
+	JSON     []byte
+	SHA256   string
+	ExportID string // export that supplied this sidecar
+	PartNo   int    // part of that export that supplied it (0 when unknown)
 }
 
 // GetSidecar returns an item's stored sidecar or nil.
 func (s *Store) GetSidecar(ctx context.Context, itemID int64) (*SidecarRow, error) {
 	var r SidecarRow
-	err := s.q.QueryRowContext(ctx, `SELECT item_id, json, sha256 FROM sidecars WHERE item_id = ?`, itemID).Scan(&r.ItemID, &r.JSON, &r.SHA256)
+	var exp sql.NullString
+	var part sql.NullInt64
+	err := s.q.QueryRowContext(ctx, `SELECT item_id, json, sha256, export_id, part_no FROM sidecars WHERE item_id = ?`, itemID).Scan(&r.ItemID, &r.JSON, &r.SHA256, &exp, &part)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
+	r.ExportID, r.PartNo = exp.String, int(part.Int64)
 	return &r, err
 }
 
+// SetSidecarExport records that a newer export (part) carries the same sidecar.
+func (s *Store) SetSidecarExport(ctx context.Context, itemID int64, exportID string, partNo int) error {
+	_, err := s.q.ExecContext(ctx, `UPDATE sidecars SET export_id = ?, part_no = ? WHERE item_id = ?`, nullStr(exportID), nullInt(int64(partNo)), itemID)
+	return err
+}
+
 // UpsertSidecar stores an item's sidecar and the extracted fields.
-func (s *Store) UpsertSidecar(ctx context.Context, itemID int64, raw []byte, sha, description string, favorited bool, lat, lon, alt *float64, people string) error {
+func (s *Store) UpsertSidecar(ctx context.Context, itemID int64, raw []byte, sha, description string, favorited bool, lat, lon, alt *float64, people, exportID string, partNo int) error {
 	var la, lo, al any
 	if lat != nil {
 		la, lo, al = *lat, *lon, *alt
 	}
-	_, err := s.q.ExecContext(ctx, `INSERT INTO sidecars(item_id, json, sha256, description, favorited, lat, lon, alt, people) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err := s.q.ExecContext(ctx, `INSERT INTO sidecars(item_id, json, sha256, description, favorited, lat, lon, alt, people, export_id, part_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(item_id) DO UPDATE SET json = excluded.json, sha256 = excluded.sha256, description = excluded.description, favorited = excluded.favorited,
-		  lat = excluded.lat, lon = excluded.lon, alt = excluded.alt, people = excluded.people`,
-		itemID, raw, sha, nullStr(description), favorited, la, lo, al, nullStr(people))
+		  lat = excluded.lat, lon = excluded.lon, alt = excluded.alt, people = excluded.people, export_id = excluded.export_id, part_no = excluded.part_no`,
+		itemID, raw, sha, nullStr(description), favorited, la, lo, al, nullStr(people), nullStr(exportID), nullInt(int64(partNo)))
 	return err
 }
 
@@ -861,6 +985,26 @@ func (s *Store) AlbumItemsByItem(ctx context.Context, itemID int64) ([]*AlbumIte
 	return s.queryAlbumItems(ctx, `item_id = ? ORDER BY album_id`, itemID)
 }
 
+// UnsupportedDirectMemberships returns an account's direct memberships that
+// no active occurrence supports any more (after a replaced part was ingested
+// again without the item in that album). A membership with an occurrence
+// deactivated by a replacement still in progress (state 'reset') is left alone
+// until that part completes; completingArchive is the part finishing right now.
+func (s *Store) UnsupportedDirectMemberships(ctx context.Context, accountID, completingArchive int64) ([]*AlbumItem, error) {
+	return s.queryAlbumItems(ctx, `direct = 1 AND album_id IN (SELECT id FROM albums WHERE account_id = ?)
+		AND NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.album_id = album_items.album_id AND o.item_id = album_items.item_id AND o.active = 1)
+		AND NOT EXISTS (SELECT 1 FROM occurrences o JOIN archives a ON a.account_id = o.account_id AND a.export_id = o.export_id AND a.part_no = o.part_no
+		                WHERE o.album_id = album_items.album_id AND o.item_id = album_items.item_id AND o.state = ? AND a.id != ?)
+		ORDER BY album_id, item_id`, accountID, OccReset, completingArchive)
+}
+
+// ClearResetState ends the wait for a part's replacement: occurrences it
+// dropped stay inactive but no longer hold reconciliation back.
+func (s *Store) ClearResetState(ctx context.Context, accountID int64, exportID string, partNo int) error {
+	_, err := s.q.ExecContext(ctx, `UPDATE occurrences SET state = ? WHERE account_id = ? AND export_id = ? AND part_no = ? AND state = ?`, OccIngested, accountID, exportID, partNo, OccReset)
+	return err
+}
+
 // AlbumItemsByAlbum returns all memberships of an album.
 func (s *Store) AlbumItemsByAlbum(ctx context.Context, albumID int64) ([]*AlbumItem, error) {
 	return s.queryAlbumItems(ctx, `album_id = ? ORDER BY item_id`, albumID)
@@ -912,6 +1056,7 @@ const (
 	OccWaiting  = "waiting"
 	OccIngested = "ingested"
 	OccResolved = "resolved"
+	OccReset    = "reset" // deactivated by a replacement of its part that is still being ingested
 )
 
 const occCols = `id, account_id, export_id, part_no, folder, entry_name, variant, sha256, album_id, item_id, state, active`
@@ -932,7 +1077,8 @@ func (s *Store) UpsertOccurrence(ctx context.Context, o *Occurrence) (int64, err
 	if _, err := s.q.ExecContext(ctx, `INSERT INTO occurrences(account_id, export_id, part_no, folder, entry_name, variant, sha256, album_id, item_id, state, active)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
 		ON CONFLICT(account_id, export_id, folder, entry_name) DO UPDATE SET part_no = excluded.part_no, variant = excluded.variant,
-		  sha256 = COALESCE(excluded.sha256, sha256), album_id = COALESCE(excluded.album_id, album_id), item_id = COALESCE(excluded.item_id, item_id), state = excluded.state`,
+		  sha256 = COALESCE(excluded.sha256, sha256), album_id = COALESCE(excluded.album_id, album_id), item_id = COALESCE(excluded.item_id, item_id), state = excluded.state,
+		  active = 1`,
 		o.AccountID, o.ExportID, o.PartNo, o.Folder, o.EntryName, o.Variant, nullStr(o.SHA256), nullInt(o.AlbumID), nullInt(o.ItemID), o.State); err != nil {
 		return 0, err
 	}
@@ -990,20 +1136,28 @@ func (s *Store) HasActiveOccurrence(ctx context.Context, albumID, itemID int64) 
 // ---- pending sidecars -----------------------------------------------------
 
 // PutPendingSidecar stores a sidecar whose media has not been seen yet.
-func (s *Store) PutPendingSidecar(ctx context.Context, accountID int64, exportID, folder, key string, raw []byte) error {
-	_, err := s.q.ExecContext(ctx, `INSERT INTO pending_sidecars(account_id, export_id, folder, media_key, json) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(account_id, export_id, folder, media_key) DO UPDATE SET json = excluded.json`, accountID, exportID, folder, key, raw)
+func (s *Store) PutPendingSidecar(ctx context.Context, accountID int64, exportID string, partNo int, folder, key string, raw []byte) error {
+	_, err := s.q.ExecContext(ctx, `INSERT INTO pending_sidecars(account_id, export_id, part_no, folder, media_key, json) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(account_id, export_id, folder, media_key) DO UPDATE SET json = excluded.json, part_no = excluded.part_no`, accountID, exportID, partNo, folder, key, raw)
 	return err
 }
 
 // GetPendingSidecar returns a stored sidecar or nil.
-func (s *Store) GetPendingSidecar(ctx context.Context, accountID int64, exportID, folder, key string) ([]byte, error) {
-	var raw []byte
-	err := s.q.QueryRowContext(ctx, `SELECT json FROM pending_sidecars WHERE account_id = ? AND export_id = ? AND folder = ? AND media_key = ?`, accountID, exportID, folder, key).Scan(&raw)
+// PendingSidecar is a stored sidecar with the part that stored it.
+type PendingSidecar struct {
+	Raw    []byte
+	PartNo int
+}
+
+func (s *Store) GetPendingSidecar(ctx context.Context, accountID int64, exportID, folder, key string) (*PendingSidecar, error) {
+	var p PendingSidecar
+	var part sql.NullInt64
+	err := s.q.QueryRowContext(ctx, `SELECT json, part_no FROM pending_sidecars WHERE account_id = ? AND export_id = ? AND folder = ? AND media_key = ?`, accountID, exportID, folder, key).Scan(&p.Raw, &part)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
-	return raw, err
+	p.PartNo = int(part.Int64)
+	return &p, err
 }
 
 // DeletePendingSidecar removes a stored sidecar.
@@ -1014,8 +1168,12 @@ func (s *Store) DeletePendingSidecar(ctx context.Context, accountID int64, expor
 
 // CountPendingSidecars returns how many sidecars wait for media in an account.
 func (s *Store) CountPendingSidecars(ctx context.Context, accountID int64) (int, error) {
+	// rows are kept for the whole export (companions may still need them);
+	// only those whose own media has not been ingested count as waiting
 	var n int
-	err := s.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_sidecars WHERE account_id = ?`, accountID).Scan(&n)
+	err := s.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_sidecars p WHERE p.account_id = ?
+		AND NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.account_id = p.account_id AND o.export_id = p.export_id
+		                AND o.folder = p.folder AND o.entry_name = p.media_key COLLATE NOCASE AND o.item_id IS NOT NULL)`, accountID).Scan(&n)
 	return n, err
 }
 
@@ -1394,21 +1552,23 @@ func (s *Store) AlbumPathTakenExcept(ctx context.Context, path string, albumID i
 
 // PendingSidecarsByPrefix returns stored sidecars whose media key (at least 8
 // characters) is a prefix of mediaName, for truncated-name matching.
-func (s *Store) PendingSidecarsByPrefix(ctx context.Context, accountID int64, exportID, folder, mediaName string) (map[string][]byte, error) {
-	rows, err := s.q.QueryContext(ctx, `SELECT media_key, json FROM pending_sidecars WHERE account_id = ? AND export_id = ? AND folder = ?
+func (s *Store) PendingSidecarsByPrefix(ctx context.Context, accountID int64, exportID, folder, mediaName string) (map[string]PendingSidecar, error) {
+	rows, err := s.q.QueryContext(ctx, `SELECT media_key, json, part_no FROM pending_sidecars WHERE account_id = ? AND export_id = ? AND folder = ?
 		AND length(media_key) >= 8 AND substr(lower(?), 1, length(media_key)) = lower(media_key)`, accountID, exportID, folder, mediaName)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string][]byte{}
+	out := map[string]PendingSidecar{}
 	for rows.Next() {
 		var k string
-		var raw []byte
-		if err := rows.Scan(&k, &raw); err != nil {
+		var p PendingSidecar
+		var part sql.NullInt64
+		if err := rows.Scan(&k, &p.Raw, &part); err != nil {
 			return nil, err
 		}
-		out[k] = raw
+		p.PartNo = int(part.Int64)
+		out[k] = p
 	}
 	return out, rows.Err()
 }

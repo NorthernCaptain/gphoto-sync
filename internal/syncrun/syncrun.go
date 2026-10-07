@@ -60,6 +60,7 @@ type AccountReport struct {
 	Pruned         []string
 	Unresolved     []store.FailedEntry
 	Errors         []string
+	Notes          []string // noteworthy, non-failing events (replaced parts, unverifiable matches)
 	Exit           int
 	DuplicateNames []string
 }
@@ -187,7 +188,7 @@ func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *Acco
 		if ar.NewestExport == "" || ingest.ExportOlder(ar.NewestExport, exportID) {
 			ar.NewestExport = exportID
 		}
-		arch, err := r.St.GetArchiveByRemoteID(ctx, f.ID)
+		arch, err := r.St.GetArchiveByRemoteID(ctx, acct.ID, f.ID)
 		if err != nil {
 			ar.fail(ExitFatal, err.Error())
 			return ar
@@ -199,15 +200,60 @@ func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *Acco
 				return ar
 			}
 		}
-		if arch != nil && arch.Status == store.ArchiveIngested {
+		if arch == nil || arch.RemoteID != f.ID {
+			// the same Drive file visible from two accounts (a shared folder) is
+			// neither this account's ingest nor a file this account may delete
+			other, err := r.St.ArchiveByRemoteIDAnyAccount(ctx, f.ID)
+			if err != nil {
+				ar.fail(ExitFatal, err.Error())
+				return ar
+			}
+			if other != nil && other.AccountID != acct.ID {
+				ar.problem(fmt.Sprintf("%s (Drive id %s) is recorded by another account's archive: shared folder? left untouched", f.Name, f.ID))
+				continue
+			}
+		}
+		// a recorded part is skipped only when the file on Drive is the one
+		// that was recorded: a re-upload under a new id or a change in place
+		// carries content the earlier ingest never saw
+		replaced := false
+		awaitingRetry := false
+		if arch != nil && arch.Status == store.ArchiveWithErrors {
+			// `retry` turned given-up entries back into failed ones
+			if counts, err := r.St.CountEntries(ctx, arch.ID); err == nil && counts[store.EntryFailed] > 0 {
+				awaitingRetry = true
+			}
+		}
+		switch d, why := decide(arch, f, awaitingRetry); d {
+		case dispReplace:
+			replaced = true
+			ar.Notes = append(ar.Notes, fmt.Sprintf("%s: %s: ingesting again from scratch", f.Name, why))
+			r.Log.Warn("part on Drive is not the recorded one", "name", f.Name, "why", why, "status", arch.Status)
+		case dispSkipUnverified:
+			ar.Notes = append(ar.Notes, fmt.Sprintf("%s was ingested from another copy whose hash is unknown: left on Drive", f.Name))
+			continue
+		case dispSkipIngested:
+			if arch.RemoteID != f.ID && !dryRun {
+				// the same content under a new id: the old file's deletion, if still
+				// owed (staged by a run whose delete failed), must be finished first,
+				// or its id would be forgotten with the file left in staging
+				if !r.settleOldRemote(ctx, ar, acc.RcloneRemote, arch, files) {
+					ar.Notes = append(ar.Notes, fmt.Sprintf("%s: an earlier copy of this part still awaits deletion; the new copy waits for it", f.Name))
+					continue
+				}
+				if err := r.St.SetArchiveRemote(ctx, arch.ID, f.ID, f.Size, f.MD5()); err != nil {
+					ar.fail(ExitFatal, err.Error())
+					return ar
+				}
+				arch.RemoteID, arch.MD5, arch.RemoteDeletedAt = f.ID, f.MD5(), ""
+			}
 			if r.Cfg.Takeout.DeleteRemoteAfterIngest && !dryRun {
 				if r.deleteRemote(ctx, ar, acc.RcloneRemote, f, arch) {
 					ar.RemoteDeleted++
 				}
 			}
 			continue
-		}
-		if arch != nil && arch.Status == store.ArchiveWithErrors {
+		case dispSkipErrors:
 			continue // reported via unresolved entries below
 		}
 		if r.Now().Sub(f.ModTime) < settle {
@@ -222,6 +268,21 @@ func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *Acco
 		if err := r.St.TouchExport(ctx, acct.ID, exportID, partNo); err != nil {
 			ar.fail(ExitFatal, err.Error())
 			return ar
+		}
+		if replaced {
+			// a deletion still owed for the old file (staged by a run whose delete
+			// failed) must be finished before the row records another id
+			if arch.RemoteID != f.ID && !r.settleOldRemote(ctx, ar, acc.RcloneRemote, arch, files) {
+				ar.Notes = append(ar.Notes, fmt.Sprintf("%s: the earlier copy of this part still awaits deletion; the replacement waits for it", f.Name))
+				continue
+			}
+			// the entry bookkeeping and occurrences belong to the old content; the
+			// new file is ingested from scratch (unchanged entries are idempotent)
+			// and the export's album listing is pruned again afterwards
+			if err := r.St.ResetPartForReingest(ctx, arch.ID, acct.ID, exportID, partNo); err != nil {
+				ar.fail(ExitFatal, err.Error())
+				return ar
+			}
 		}
 		local := filepath.Join(inbox, f.Name)
 		arch, err = r.St.UpsertArchive(ctx, &store.Archive{AccountID: acct.ID, RemoteID: f.ID, Name: f.Name, ExportID: exportID, PartNo: partNo,
@@ -266,11 +327,17 @@ func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *Acco
 				}
 			}
 			if r.Cfg.Takeout.DeleteRemoteAfterIngest {
-				if a2, _ := r.St.GetArchiveByRemoteID(ctx, f.ID); a2 != nil && r.deleteRemote(ctx, ar, acc.RcloneRemote, f, a2) {
+				if a2, _ := r.St.GetArchiveByRemoteID(ctx, acct.ID, f.ID); a2 != nil && r.deleteRemote(ctx, ar, acc.RcloneRemote, f, a2) {
 					ar.RemoteDeleted++
 				}
 			}
 		}
+	}
+
+	// parts staged for deletion by an earlier run whose delete step failed are
+	// no longer in the Takeout folder listing; finish them from the staging folder
+	if r.Cfg.Takeout.DeleteRemoteAfterIngest && !dryRun && acct.ID != 0 {
+		r.finishStagedDeletes(ctx, ar, acct.ID, acc.RcloneRemote, files)
 	}
 
 	// album pruning for exports whose complete listing is confirmed
@@ -317,6 +384,12 @@ func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *Acco
 		}
 	}
 	return ar
+}
+
+// problem records a non-fatal failure that keeps the run from reporting success.
+func (ar *AccountReport) problem(msg string) {
+	ar.Errors = append(ar.Errors, msg)
+	ar.Exit = Worst(ar.Exit, ExitPartial)
 }
 
 func (ar *AccountReport) fail(code int, msg string) {
@@ -397,6 +470,61 @@ func (r *Runner) fetch(ctx context.Context, remoteName string, f rclone.RemoteFi
 	return nil
 }
 
+// disposition is what to do with a listed part given its archive row.
+type disposition int
+
+const (
+	dispNew            disposition = iota // nothing recorded: fetch and ingest
+	dispResume                            // the recorded file, not finished: continue where it stopped
+	dispSkipIngested                      // the recorded file, ingested: only remote deletion may remain
+	dispSkipUnverified                    // ingested from a copy that cannot be verified: leave it alone
+	dispSkipErrors                        // ingested with given-up entries: reported, retried via `retry`
+	dispReplace                           // another file, or one of unprovable identity: start over
+)
+
+// decide tells whether a listed file resumes, replaces or is skipped for the
+// archive recorded under its name. Finished entries are only ever reused for
+// a file proven to be the recorded one; for an unproven file nothing is
+// trusted: an unfinished part starts over, a finished one is left alone. A
+// part ingested with given-up entries is skipped unless some entries await a
+// retry again (awaitingRetry), in which case it resumes.
+func decide(arch *store.Archive, f rclone.RemoteFile, awaitingRetry bool) (disposition, string) {
+	if arch == nil {
+		return dispNew, ""
+	}
+	why, verified := compareArchive(arch, f)
+	switch {
+	case why != "":
+		return dispReplace, why
+	case !verified && arch.Status == store.ArchiveIngested:
+		return dispSkipUnverified, ""
+	case !verified:
+		return dispReplace, "cannot be proven to be the file ingested before (no hash recorded)"
+	case arch.Status == store.ArchiveIngested:
+		return dispSkipIngested, ""
+	case arch.Status == store.ArchiveWithErrors && !awaitingRetry:
+		return dispSkipErrors, ""
+	}
+	return dispResume, ""
+}
+
+// compareArchive tells whether the file on Drive is the one recorded for a
+// part. why is non-empty when they are known to differ; verified is true when
+// the match was established by hash, or by Drive id and size when no hash is
+// recorded.
+func compareArchive(arch *store.Archive, f rclone.RemoteFile) (why string, verified bool) {
+	if arch.MD5 != "" && f.MD5() != "" {
+		if arch.MD5 != f.MD5() {
+			return fmt.Sprintf("md5 %s on Drive, %s ingested", f.MD5(), arch.MD5), true
+		}
+		return "", true
+	}
+	if arch.Size > 0 && f.Size > 0 && arch.Size != f.Size {
+		return fmt.Sprintf("size %d on Drive, %d ingested", f.Size, arch.Size), true
+	}
+	return "", arch.RemoteID == f.ID && arch.Size > 0 && f.Size > 0
+}
+
 // deleteRemote trashes an ingested part on Drive after re-checking that the
 // name is unique and the id/md5 still match.
 func (r *Runner) deleteRemote(ctx context.Context, ar *AccountReport, remote string, f rclone.RemoteFile, arch *store.Archive) bool {
@@ -405,7 +533,7 @@ func (r *Runner) deleteRemote(ctx context.Context, ar *AccountReport, remote str
 	}
 	files, err := r.RC.List(ctx, remote)
 	if err != nil {
-		ar.Errors = append(ar.Errors, "re-list before delete: "+err.Error())
+		ar.problem("re-list before delete: " + err.Error())
 		return false
 	}
 	n := 0
@@ -416,8 +544,12 @@ func (r *Runner) deleteRemote(ctx context.Context, ar *AccountReport, remote str
 			match = &files[i]
 		}
 	}
-	if n != 1 || match.ID != arch.RemoteID || (arch.MD5 != "" && match.MD5() != "" && match.MD5() != arch.MD5) {
-		ar.Errors = append(ar.Errors, fmt.Sprintf("%s: not deleted remotely (name count %d, id/md5 mismatch)", f.Name, n))
+	if n != 1 {
+		ar.problem(fmt.Sprintf("%s: not deleted remotely: %d files carry this name", f.Name, n))
+		return false
+	}
+	if why := notDeletable(arch, *match); why != "" {
+		ar.problem(fmt.Sprintf("%s: not deleted remotely: %s", f.Name, why))
 		return false
 	}
 	// move the exact file id into a folder only this program writes to, then
@@ -425,16 +557,129 @@ func (r *Runner) deleteRemote(ctx context.Context, ar *AccountReport, remote str
 	remoteName, _ := rclone.SplitRemote(remote)
 	trashPath := remote + "/" + trashFolder + "/" + f.Name + "." + arch.RemoteID
 	if err := r.RC.MoveID(ctx, remoteName, arch.RemoteID, trashPath); err != nil {
-		ar.Errors = append(ar.Errors, fmt.Sprintf("%s: remote move: %v", f.Name, err))
+		ar.problem(fmt.Sprintf("%s: remote move: %v", f.Name, err))
 		return false
 	}
 	if err := r.RC.DeleteFile(ctx, trashPath); err != nil {
-		ar.Errors = append(ar.Errors, fmt.Sprintf("%s: remote delete: %v", f.Name, err))
+		// the file sits in the staging folder under its id; the next run finds it there
+		ar.problem(fmt.Sprintf("%s: remote delete (staged, retried next run): %v", f.Name, err))
 		return false
 	}
 	_ = r.St.SetArchiveRemoteDeleted(ctx, arch.ID)
 	r.Log.Info("trashed ingested part on Drive", "name", f.Name)
 	return true
+}
+
+// notDeletable tells why a file on Drive may not be deleted for an ingested
+// archive: it must carry the recorded id and, when a hash was recorded, the
+// listing must report that same hash (a file changed after it was ingested, or
+// one whose hash Drive does not report yet, stays for a later retry); without
+// a recorded hash the sizes must agree.
+func notDeletable(arch *store.Archive, f rclone.RemoteFile) string {
+	switch {
+	case f.ID != arch.RemoteID:
+		return fmt.Sprintf("Drive id %s, ingested %s", f.ID, arch.RemoteID)
+	case arch.MD5 != "" && f.MD5() == "":
+		return "Drive reports no md5 to compare with the ingested file"
+	case arch.MD5 != "" && f.MD5() != arch.MD5:
+		return fmt.Sprintf("md5 %s on Drive, %s ingested", f.MD5(), arch.MD5)
+	case arch.MD5 == "" && arch.Size > 0 && f.Size != arch.Size:
+		return fmt.Sprintf("size %d on Drive, %d ingested", f.Size, arch.Size)
+	}
+	return ""
+}
+
+// listStaged lists the staging folder; one that was never created is empty.
+func (r *Runner) listStaged(ctx context.Context, remote string) ([]rclone.RemoteFile, error) {
+	staged, err := r.RC.List(ctx, remote+"/"+trashFolder)
+	if err != nil && strings.Contains(err.Error(), "directory not found") {
+		return nil, nil
+	}
+	return staged, err
+}
+
+// deleteStaged finishes the deletion owed for an archive's Drive file that is
+// no longer in the Takeout folder: deleted from the staging folder when it is
+// there, recorded as deleted when it is in neither place. It reports whether
+// the archive owes nothing any more.
+func (r *Runner) deleteStaged(ctx context.Context, ar *AccountReport, remote string, a *store.Archive, staged []rclone.RemoteFile) bool {
+	var match *rclone.RemoteFile
+	for i := range staged {
+		if staged[i].ID == a.RemoteID {
+			match = &staged[i]
+		}
+	}
+	if match == nil {
+		_ = r.St.SetArchiveRemoteDeleted(ctx, a.ID)
+		ar.Notes = append(ar.Notes, fmt.Sprintf("%s is no longer on Drive: recorded as deleted", a.Name))
+		return true
+	}
+	if a.Errors > 0 {
+		ar.problem(fmt.Sprintf("%s: staged file left alone: the part was ingested with errors", a.Name))
+		return false
+	}
+	if why := notDeletable(a, *match); why != "" {
+		ar.problem(fmt.Sprintf("%s: staged file left alone: %s", a.Name, why))
+		return false
+	}
+	if err := r.RC.DeleteFile(ctx, remote+"/"+trashFolder+"/"+match.Name); err != nil {
+		ar.problem(fmt.Sprintf("%s: remote delete from staging: %v", a.Name, err))
+		return false
+	}
+	_ = r.St.SetArchiveRemoteDeleted(ctx, a.ID)
+	ar.RemoteDeleted++
+	r.Log.Info("deleted staged part on Drive", "name", a.Name)
+	return true
+}
+
+// settleOldRemote reports whether an archive owes nothing for the Drive file
+// it currently records, finishing a staged deletion when it can. A file still
+// in the Takeout folder is handled on its own turn of the listing, so the
+// archive is not free to be matched to another file yet.
+func (r *Runner) settleOldRemote(ctx context.Context, ar *AccountReport, remote string, arch *store.Archive, root []rclone.RemoteFile) bool {
+	if arch.RemoteID == "" || arch.RemoteDeletedAt != "" {
+		return true
+	}
+	for _, f := range root {
+		if f.ID == arch.RemoteID {
+			return false
+		}
+	}
+	staged, err := r.listStaged(ctx, remote)
+	if err != nil {
+		ar.problem("list staging folder: " + err.Error())
+		return false
+	}
+	return r.deleteStaged(ctx, ar, remote, arch, staged)
+}
+
+// finishStagedDeletes deletes parts that an earlier run moved into the
+// staging folder without managing to delete them. A part that is in neither
+// the Takeout folder nor the staging folder is gone and recorded as deleted.
+func (r *Runner) finishStagedDeletes(ctx context.Context, ar *AccountReport, acctID int64, remote string, root []rclone.RemoteFile) {
+	waiting, err := r.St.ArchivesAwaitingRemoteDelete(ctx, acctID)
+	if err != nil || len(waiting) == 0 {
+		return
+	}
+	inRoot := map[string]bool{}
+	for _, f := range root {
+		inRoot[f.ID] = true
+	}
+	var staged []rclone.RemoteFile
+	listed := false
+	for _, a := range waiting {
+		if inRoot[a.RemoteID] || a.Errors > 0 {
+			continue // still in the Takeout folder: the main loop handles it
+		}
+		if !listed {
+			listed = true
+			if staged, err = r.listStaged(ctx, remote); err != nil {
+				ar.problem("list staging folder: " + err.Error())
+				return
+			}
+		}
+		r.deleteStaged(ctx, ar, remote, a, staged)
+	}
 }
 
 // ---- reporting ----------------------------------------------------------------
@@ -467,6 +712,9 @@ func (rep *Report) HTML() string {
 		for _, r := range a.Results {
 			fmt.Fprintf(&b, "• %s: %s — added %d, duplicates %d, changed %d, promoted %d, links %d, failed %d, pending sidecars %d, %s\n",
 				esc(r.Part), esc(r.Status), r.Added, r.Duplicates, r.Changed, r.Promoted, r.Links, r.Failed+r.GivenUp, r.PendingSidecars, esc(r.Duration.Round(time.Second).String()))
+			if r.Versioned > 0 {
+				fmt.Fprintf(&b, "   older export: %d files kept as versions, current content untouched\n", r.Versioned)
+			}
 			for i, e := range r.Errors {
 				if i >= 5 {
 					fmt.Fprintf(&b, "   … %d more\n", len(r.Errors)-5)
@@ -497,6 +745,9 @@ func (rep *Report) HTML() string {
 				}
 				fmt.Fprintf(&b, "   %s: %s\n", esc(u.Entry), esc(u.LastErr))
 			}
+		}
+		for _, n := range a.Notes {
+			fmt.Fprintf(&b, "· %s\n", esc(n))
 		}
 		for _, e := range a.Errors {
 			fmt.Fprintf(&b, "! %s\n", esc(e))

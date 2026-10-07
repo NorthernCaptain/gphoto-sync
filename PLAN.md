@@ -145,7 +145,14 @@ host                                   container (docker run --rm, weekly, exits
 └────────────────────────┘             └──────────────────────────────────────────────────┘
 ```
 
-- **Runner**: the `sync` subcommand. Takes a lock file in `/state`, then for each configured
+- **Runner**: the `sync` subcommand. Every writing command (`sync`, `ingest`, `retry`,
+  `relink`, `exports confirm`, `telegram pair`) takes an exclusive `flock` on
+  `/state/gphoto-sync.lock` before journal recovery and holds it until the process exits;
+  a second writer (a manual `ingest` while the timer's `sync` runs) fails fast with exit 1
+  instead of sharing temp paths and racing the journaled moves. Dry runs and read-only
+  commands (`status`, `verify`, `check-remote`, `telegram chats`/`test`) do not lock, do
+  not replay the journal, and open the database without creating or migrating it (they
+  fail with a clear message until a writing command has run). The runner then, for each configured
   account (config order, or only `--account <name>`) discovers, fetches and ingests, prints
   a per-account summary, and exits with the worst exit code seen (3.6). Accounts run
   sequentially so staging never holds more than one part.
@@ -169,11 +176,29 @@ host                                   container (docker run --rm, weekly, exits
    exports are ordered by timestamp then sequence wherever "older" or "newer" is used. The **Drive file id is the key** everywhere; the name is
    only for display and for the local file. Drive allows two files with the same name in one
    folder: if the listing contains duplicate names, those parts are reported and neither is
-   fetched or deleted until the duplicate is removed by hand. A Drive id already `ingested`
-   in the `archives` table is skipped for ingest but, if `delete_remote_after_ingest` is on
-   and `remote_deleted_at` is still NULL, its remote deletion is retried now (a failed
-   deletion on an earlier run must not leave the part on Drive forever). A part in `partial`
-   state is fetched again and only its failed entries are retried. Group by export id
+   fetched or deleted until the duplicate is removed by hand. A part already `ingested`
+   in the `archives` table (found by Drive id, else by account + export + part number) is
+   skipped only when the listed file is the recorded one: MD5s are compared when both are
+   known, else sizes. A file that differs (re-uploaded under a new id, or changed in
+   place) is a new ingest of that part: its entry bookkeeping is dropped, the part's
+   occurrences are deactivated (the re-ingest reactivates the ones still present), album
+   memberships confirmed only by its vanished occurrences fall back to the newest remaining
+   evidence, the export's `albums_pruned_at` and the albums' applied-listing marks are
+   cleared so the listing is pruned again, and the file goes through the normal fetch and
+   ingest; the report notes it. Occurrences the reset deactivated carry state `reset`
+   until their part is ingested again, so another part finishing meanwhile leaves their
+   memberships alone. Once a part is fully ingested, direct memberships that no
+   active occurrence supports any more (the replacement dropped the item from the album,
+   and a non-authoritative export is never pruned) lose their link, companions' group
+   links are recomputed. A match found by name alone whose
+   content cannot be verified (no hash recorded): an `ingested` part is skipped and never
+   trashed; an unfinished part is started over, since its finished entries may belong to
+   another file. Recording another remote file for a part clears `remote_deleted_at`, so
+   the new file's deletion is owed again. For a
+   verified `ingested` part, if `delete_remote_after_ingest` is on and `remote_deleted_at`
+   is still NULL, its remote deletion is retried now (a failed deletion on an earlier run
+   must not leave the part on Drive forever). A part in `partial` state is fetched again
+   and only its failed entries are retried. Group by export id
    (one export = N parts).
 2. **Settle**: Takeout uploads parts over several hours. Skip any part whose `ModTime` is
    younger than `settle` (default 2h); it is picked up by the next weekly run. Parts are
@@ -208,7 +233,12 @@ host                                   container (docker run --rm, weekly, exits
    - anything else (`archive_browser.html`, `print-subscriptions.json`,
      `user-generated-memory-titles.json`, `shared_album_comments.json`, …) → ignored but
      logged once.
-   Entries already recorded for this part (resume after a crash) are skipped by name.
+   Entries already recorded for this part (resume after a crash) are skipped by name,
+   but their sidecars are still looked up: a sidecar that failed to read on the earlier
+   run and parses now is applied to the finished media (promotion of a fallback item, or
+   the first sidecar of an item that has none), exactly like a sidecar arriving in a later
+   part. Only items without a stored sidecar are touched this way, so the index's fuzzy
+   rules (title, stem prefix) can never replace metadata that an exact match supplied.
 5. **Ingest a media entry**:
    1. Stream to `/data/<account>/.tmp/<uuid>`, computing SHA-256 while writing.
    2. Match the sidecar using the known naming variants: `X.jpg.supplemental-metadata.json`,
@@ -228,13 +258,22 @@ host                                   container (docker run --rm, weekly, exits
       (membership). If the **sidecar changed** (description, favorite, people, even
       `photoTakenTime`), rewrite the sidecar file and row and refresh the derived fields;
       a changed capture time or title recomputes the path and `rename()`s the file. If
-      the **bytes changed** (a re-edited `edited` variant, typically), the item is
+      the **bytes changed** (a re-edited `edited` variant, typically) and the part comes
+      from the same or a newer export than the one that supplied the current bytes
+      (`items.bytes_export_id`), the item is
       re-pointed to the new blob: the superseded file is kept, renamed in place to
       `<name>~v<first 8 hex of its own sha256>.<ext>` (unique per content, so two changes
       on one day never collide; the rename refuses to replace an existing file unless it
       is already the same inode) and recorded in `item_versions` (backup semantics,
       nothing is deleted), album links are re-created against the new inode,
-      and the old blob follows the canonical-path rule (step 10). If no item carries the
+      and the old blob follows the canonical-path rule (step 10). Parts are not
+      guaranteed to arrive in export order (a late part of an older export, a manual
+      ingest of an old archive): content from an export **older** than the one that last
+      supplied the item's bytes never replaces them; the differing bytes are kept as a
+      version under the same `~v<sha8>` naming and only the occurrence is recorded.
+      Likewise a sidecar older than the stored one (`sidecars.export_id`) is ignored, and
+      an identical sidecar or identical bytes seen in a newer export just move the
+      recorded export forward. If no item carries the
       key, a `fallback` item may be **promoted** instead of creating a second item, but
       only on an unambiguous match (step 9).
       Without a usable sidecar the identity is **provisional and per occurrence**:
@@ -324,9 +363,12 @@ host                                   container (docker run --rm, weekly, exits
       removed, and the occurrences of that item, hence its derived memberships, move with
       it. If
       the promoted key already belongs to another item (the same photo was ingested with
-      its sidecar earlier), the fallback item is merged into it: its memberships are
-      transferred, then its path is unlinked and its row deleted, subject to the blob
-      rule below.
+      its sidecar earlier), the fallback item is merged into it. First the fallback's bytes
+      and the arriving sidecar are applied to that item under the export-order rule of
+      step 8 (a newer export's bytes seen before their sidecar become current, the older
+      bytes a kept version; an older export's bytes are kept as a version only), then the
+      fallback's memberships are transferred, its path is unlinked and its row deleted,
+      subject to the blob rule below.
   10. **Blob canonical path rule.** `blobs.canonical_path` is the path new hardlinks are
       made from. A blob is referenced by item paths (`items.lib_path`) and by kept
       superseded files (`item_versions.path`); both count. Before any referencing path is
@@ -387,10 +429,15 @@ host                                   container (docker run --rm, weekly, exits
    if there is room.
    For an `ingested` part: delete the local copy unless `keep_archives: true`; if
    `delete_remote_after_ingest: true`, re-list the folder, confirm that exactly one file
-   carries this name and that its id and MD5 match the `archives` row, then
-   `rclone deletefile` it (rclone trashes by default, recoverable for 30 days) and set
-   `remote_deleted_at`; if the check fails or the deletion errors, leave it NULL, report
-   it, and let step 1 retry next run. Then fetch the next part.
+   carries this name and that its id and MD5 match the `archives` row, then move that
+   exact id (`rclone backend moveid`) into `.gphoto-sync-trash/<name>.<id>`, a folder only
+   this program writes to, and `rclone deletefile` that unique path (rclone trashes by
+   default, recoverable for 30 days); set `remote_deleted_at`. If the check fails or the
+   move errors, leave it NULL, report it, and let step 1 retry next run. If the move
+   succeeded but the delete failed, the file is no longer in the Takeout listing: at the
+   end of every run, ingested parts with `remote_deleted_at` NULL that are absent from the
+   listing are looked up by id in the staging folder and deleted from there; one absent
+   from both is gone and recorded as deleted. Then fetch the next part.
 8. **Report**: print a summary (parts seen/ingested/failed, media added, duplicates,
    links, duration) and send it to Telegram (3.9), on success as well as on failure. If the
    newest export timestamp is older than `expected_interval + grace` (default 30 + 14 days),
@@ -453,7 +500,12 @@ membership marks every occurrence that supports that (album, item) pair and has
 an export id older than E as `active = 0`; memberships are derived from **active** occurrences only,
 and re-attribution (3.2 step 5.9) only ever moves active occurrences, so a pruned link can
 never be re-derived from history. A listing older than the newest
-already-applied complete listing for that album is never used for pruning. The `relink`
+already-applied complete listing for that album is never used for pruning, and an
+occurrence from an export older than that listing never creates a membership the
+listing does not contain (a delayed part of an old export is recorded as history, not
+re-linked into the album); for an album created after the last pruning, the account's
+newest applied listing counts. When a sidecar change or a promotion renames a library
+file, its album links are renamed with it (symlinks re-pointed). The `relink`
 subcommand only rebuilds folders from the current DB state; it never re-applies an old
 listing. `sync --dry-run` prints what a pending prune would remove.
 
@@ -468,11 +520,14 @@ blobs        (id, sha256 UNIQUE, size, canonical_path, first_seen)   -- one row 
 items        (id, account_id, blob_id, google_id, variant {original,edited,motion}, identity_key,
               identity_src {google_id,fallback}, filename, ext, mime, width, height,
               taken_at, taken_src, lib_path UNIQUE, group_id, archived_export_id NULL,
+              bytes_export_id NULL,                -- export that last supplied the bytes at lib_path
               first_seen, last_seen,
               UNIQUE(account_id, identity_key))   -- key = google_id#variant, else occ:export#folder#filename
                                                   -- lib_path, albums.path, link_path, canonical_path: all relative
                                                   -- to data_dir and prefixed with the account folder
-sidecars     (item_id, json BLOB, description, favorited, lat, lon, alt, people JSON)
+sidecars     (item_id, json BLOB, description, favorited, lat, lon, alt, people JSON,
+              export_id NULL, part_no NULL)       -- export and part that supplied this sidecar
+                                                  -- (a replaced part may correct it by exact match)
 albums       (id, account_id, title, album_date, takeout_folder, kind {own,shared,partner},
               path UNIQUE, created, updated)      -- identity (account, title, album_date) or (account, takeout_folder)
 occurrences  (id, account_id, export_id, part_no, folder, entry_name, variant, sha256,
@@ -495,8 +550,9 @@ archive_entries (archive_id, entry_name, status {done,skipped,failed,given_up}, 
               last_error)                        -- resume inside a part, retry failed entries
 exports      (account_id, export_id, highest_part, confirmed_parts, last_part_seen_at,
               complete_at, authoritative, albums_pruned_at)   -- completeness + pruning rights, see 3.3
-pending_sidecars (account_id, export_id, folder, media_key, json,
-              PRIMARY KEY(account_id, export_id, folder, media_key))   -- sidecars seen before their media
+pending_sidecars (account_id, export_id, part_no, folder, media_key, json,
+              PRIMARY KEY(account_id, export_id, folder, media_key))   -- sidecars seen before their media;
+                                                                      -- part_no: who stored it (dropped when that part is replaced)
 runs         (account_id, started, finished, exit_code, counts JSON)
 errors       (ts, account_id, ref, message)
 telegram_chats (chat_id PRIMARY KEY, user_id, username, display_name, paired_at, revoked_at)
@@ -556,7 +612,9 @@ log:
 
 ```
 gphoto-sync sync [--account NAME] [--dry-run]              # all accounts by default: discover, fetch, ingest, report, exit
-gphoto-sync ingest --account NAME <dir|zip>... [--full-albums --parts N]   # local Takeout dump, no rclone
+gphoto-sync ingest --account NAME <dir|zip>... [--full-albums --parts N] [--replace]   # local Takeout dump, no rclone
+                                                           # a part ingested before under the same name resumes; a zip
+                                                           # known to differ (md5, else size) or --replace starts it over
 gphoto-sync exports confirm --account NAME --export ID --parts N   # record the part count Google reports
 gphoto-sync retry --account NAME [--part NAME]             # reset given-up entries so the next run retries them
 gphoto-sync check-remote [--account NAME]                  # list parts rclone can see and their state

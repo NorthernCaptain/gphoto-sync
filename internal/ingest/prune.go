@@ -203,6 +203,46 @@ func (pr *partRun) recomputeGroup(album *store.Album, still *store.Item) (int, e
 	return n, nil
 }
 
+// ReconcileMemberships removes direct memberships that no active occurrence
+// supports: a part ingested again after its file changed may no longer list an
+// item in an album, and a non-authoritative export is never pruned. Links a
+// companion still derives from its still are kept; group links of removed
+// stills are recomputed. Memberships whose occurrences were deactivated by a
+// replacement still in progress wait for that part (completingArchive is the
+// part finishing now, whose replacement this call completes).
+func (ing *Ingester) ReconcileMemberships(ctx context.Context, acct *store.Account, completingArchive int64) (removed int, err error) {
+	rows, err := ing.st.UnsupportedDirectMemberships(ctx, acct.ID, completingArchive)
+	if err != nil || len(rows) == 0 {
+		return 0, err
+	}
+	pr := &partRun{ing: ing, ctx: ctx, acct: acct}
+	for _, row := range rows {
+		album, err := ing.st.GetAlbum(ctx, row.AlbumID)
+		if err != nil {
+			return removed, err
+		}
+		item, err := ing.st.GetItem(ctx, row.ItemID)
+		if err != nil {
+			return removed, err
+		}
+		if album == nil || item == nil {
+			continue // dangling row: nothing on disk to remove
+		}
+		if err := pr.removeDirect(album, item, row, ""); err != nil {
+			return removed, fmt.Errorf("%s: %w", row.LinkPath, err)
+		}
+		removed++
+		ing.log.Info("album membership no longer listed by any ingested part, link removed", "link", row.LinkPath)
+		if item.IdentityKey == item.GroupID {
+			if _, err := pr.recomputeGroup(album, item); err != nil {
+				return removed, err
+			}
+		}
+		_ = os.Remove(ing.abs(album.Path)) // only succeeds when the folder is empty
+	}
+	return removed, nil
+}
+
 // PrunableExports lists exports of an account that are ready for pruning but
 // have not been pruned yet.
 func (ing *Ingester) PrunableExports(ctx context.Context, account string) ([]string, error) {

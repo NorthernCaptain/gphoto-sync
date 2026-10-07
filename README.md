@@ -26,8 +26,9 @@ timer. Design and decisions: [PLAN.md](PLAN.md).
      `config.yaml` (start from `config/config.example.yaml`), `rclone/rclone.conf`,
      `telegram.token`.
    - `/home/leo/gphoto-backup/data` — the library; `/home/leo/gphoto-backup/state` — SQLite
-     database and inbox staging (needs ~60 GB free); `/home/leo/gphoto-backup/downloads` —
-     manually downloaded parts for `ingest`.
+     database, inbox staging (needs ~60 GB free) and the writer lock `gphoto-sync.lock`
+     (a second `sync`/`ingest` started while one runs exits 1 at once);
+     `/home/leo/gphoto-backup/downloads` — manually downloaded parts for `ingest`.
 4. **Build and install**:
    ```sh
    cd /home/leo/gphoto-sync && DOCKER_BUILDKIT=0 docker build -t gphoto-sync:local .

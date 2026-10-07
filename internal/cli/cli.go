@@ -17,6 +17,7 @@ import (
 
 	"gphoto-sync/internal/config"
 	"gphoto-sync/internal/db"
+	"gphoto-sync/internal/fsops"
 	"gphoto-sync/internal/ingest"
 	"gphoto-sync/internal/store"
 )
@@ -74,7 +75,7 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `usage: gphoto-sync <command> [flags]
 
   sync          [--account NAME] [--dry-run]        discover parts on Drive via rclone, fetch, ingest, report, exit
-  ingest        --account NAME [--max-entries N] [--dry-run] [--full-albums --parts N] <part.zip|dir>...
+  ingest        --account NAME [--max-entries N] [--dry-run] [--full-albums --parts N] [--replace] <part.zip|dir>...
   check-remote  [--account NAME]                    list parts rclone can see and their state
   status        [--account NAME]
   verify        [--account NAME] [--hash]
@@ -91,11 +92,17 @@ common flags: --config PATH (default $GPS_CONFIG or config/config.yaml)
 }
 
 type env struct {
-	cfg *config.Config
-	st  *store.Store
-	log *slog.Logger
-	ing *ingest.Ingester
+	cfg  *config.Config
+	st   *store.Store
+	log  *slog.Logger
+	ing  *ingest.Ingester
+	lock *os.File // writer lock in state_dir, held until the process exits
 }
+
+// writerLock pins the lock file for the life of the process: an *os.File that
+// becomes unreachable is finalized, which closes the descriptor and with it
+// the flock, so the handle must stay referenced even when the env is not.
+var writerLock *os.File
 
 func commonFlags(fs *flag.FlagSet) *string {
 	def := os.Getenv("GPS_CONFIG")
@@ -107,7 +114,8 @@ func commonFlags(fs *flag.FlagSet) *string {
 
 func setup(ctx context.Context, cfgPath string) (*env, error) { return setupMode(ctx, cfgPath, false) }
 
-// setupMode opens everything; readOnly skips journal recovery (for dry runs).
+// setupMode opens everything; readOnly skips the writer lock and journal
+// recovery (for dry runs and read-only commands).
 func setupMode(ctx context.Context, cfgPath string, readOnly bool) (*env, error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -132,13 +140,29 @@ func setupMode(ctx context.Context, cfgPath string, readOnly bool) (*env, error)
 	}
 	log := slog.New(h)
 	slog.SetDefault(log)
-	if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
-		return nil, err
+	// one writer at a time: two ingests would share temp paths and race the
+	// journaled moves; the lock is released by process exit. Read-only
+	// commands touch nothing on disk, not even the directories
+	var lock *os.File
+	if !readOnly {
+		if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+			return nil, err
+		}
+		var err error
+		if lock, err = fsops.Lock(filepath.Join(cfg.StateDir, "gphoto-sync.lock")); err != nil {
+			return nil, err
+		}
+		writerLock = lock
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-		return nil, err
+	// read-only commands never create or migrate the database
+	open := db.Open
+	if readOnly {
+		open = db.OpenReadOnly
 	}
-	d, err := db.Open(ctx, filepath.Join(cfg.StateDir, "state.db"))
+	d, err := open(ctx, filepath.Join(cfg.StateDir, "state.db"))
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +173,7 @@ func setupMode(ctx context.Context, cfgPath string, readOnly bool) (*env, error)
 			return nil, fmt.Errorf("journal recovery: %w", err)
 		}
 	}
-	return &env{cfg: cfg, st: st, log: log, ing: ing}, nil
+	return &env{cfg: cfg, st: st, log: log, ing: ing, lock: lock}, nil
 }
 
 func fatal(err error) int {
@@ -167,6 +191,7 @@ func cmdIngest(ctx context.Context, args []string) int {
 	parts := fs.Int("parts", 0, "confirmed number of parts in this export")
 	exportID := fs.String("export-id", "", "export id when the file name is not a takeout part name")
 	partNo := fs.Int("part", 0, "part number when the file name is not a takeout part name")
+	replace := fs.Bool("replace", false, "the file replaces an earlier ingest of this part (a changed zip of the same size is not detected otherwise)")
 	if err := fs.Parse(args); err != nil {
 		return ExitFatal
 	}
@@ -205,7 +230,7 @@ func cmdIngest(ctx context.Context, args []string) int {
 			return fatal(fmt.Errorf("--full-albums needs exactly parts 1..%d; missing: %s", *parts, strings.Join(missing, ", ")))
 		}
 	}
-	e, err := setup(ctx, *cfgPath)
+	e, err := setupMode(ctx, *cfgPath, *dryRun)
 	if err != nil {
 		return fatal(err)
 	}
@@ -243,11 +268,11 @@ func cmdIngest(ctx context.Context, args []string) int {
 		}
 		fi, _ := os.Stat(p)
 		meta := ingest.PartMeta{Account: *account, RcloneRemote: remote, ExportID: eid, PartNo: pn, Name: name, LocalPath: p}
-		if fi != nil {
+		if fi != nil && fi.Mode().IsRegular() {
 			meta.Size = fi.Size()
 		}
 		e.log.Info("ingest start", "account", *account, "part", name, "export", eid, "part_no", pn)
-		res, err := e.ing.IngestPart(ctx, src, meta, ingest.Options{MaxEntries: *maxEntries, DryRun: *dryRun, FullAlbums: *fullAlbums, Parts: *parts})
+		res, err := e.ing.IngestPart(ctx, src, meta, ingest.Options{MaxEntries: *maxEntries, DryRun: *dryRun, FullAlbums: *fullAlbums, Parts: *parts, Replace: *replace})
 		src.Close()
 		if err != nil {
 			e.log.Error("ingest failed", "part", name, "err", err)
@@ -278,6 +303,12 @@ func cmdIngest(ctx context.Context, args []string) int {
 
 func printResult(r *ingest.Result) {
 	fmt.Printf("%s: %s\n", r.Part, r.Status)
+	if r.Replaced {
+		fmt.Println("  replaced an earlier ingest of this part (its entries and occurrences were reset)")
+	}
+	if r.Unlinked > 0 {
+		fmt.Printf("  %d album links removed: no ingested part lists them any more\n", r.Unlinked)
+	}
 	fmt.Printf("  entries %d, media %d, albums %d, skipped %d\n", r.Entries, r.Media, r.Albums, r.Skipped)
 	fmt.Printf("  added %d, duplicates %d, changed %d, promoted %d, merged %d, links %d\n", r.Added, r.Duplicates, r.Changed, r.Promoted, r.Merged, r.Links)
 	fmt.Printf("  failed %d, given up %d, unresolved %d, pending sidecars %d, took %s\n", r.Failed, r.GivenUp, r.Unresolved, r.PendingSidecars, r.Duration.Round(time.Second))
@@ -300,7 +331,7 @@ func cmdStatus(ctx context.Context, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return ExitFatal
 	}
-	e, err := setup(ctx, *cfgPath)
+	e, err := setupMode(ctx, *cfgPath, true)
 	if err != nil {
 		return fatal(err)
 	}
@@ -347,7 +378,7 @@ func cmdVerify(ctx context.Context, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return ExitFatal
 	}
-	e, err := setup(ctx, *cfgPath)
+	e, err := setupMode(ctx, *cfgPath, true)
 	if err != nil {
 		return fatal(err)
 	}
