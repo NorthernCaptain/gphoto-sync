@@ -426,6 +426,12 @@ func (s *Store) ResetPartForReingest(ctx context.Context, archiveID, accountID i
 		if _, err := q.ExecContext(ctx, `DELETE FROM pending_sidecars WHERE account_id = ? AND export_id = ? AND (part_no = ? OR part_no IS NULL)`, accountID, exportID, partNo); err != nil {
 			return err
 		}
+		// stored sidecars of other parts consumed by media or memberships this
+		// part supported are reopened: ResolvePending finds the surviving
+		// evidence again, or makes the membership anew from the photo elsewhere
+		if _, err := q.ExecContext(ctx, `UPDATE pending_sidecars SET resolved = 0 WHERE account_id = ? AND export_id = ? AND resolved = 1`, accountID, exportID); err != nil {
+			return err
+		}
 		// stored sidecars this part supplied must be seen again in the replacement
 		// (ReleaseUnconfirmedSidecars handles the rest once it is ingested)
 		if _, err := q.ExecContext(ctx, `UPDATE sidecars SET reconfirm = 1 WHERE export_id = ? AND part_no = ? AND item_id IN (SELECT id FROM items WHERE account_id = ?)`, exportID, partNo, accountID); err != nil {
@@ -757,6 +763,20 @@ func (s *Store) FindFallbackItems(ctx context.Context, accountID int64, sha, fil
 // ItemsByGroup returns all items of a companion group in an account.
 func (s *Store) ItemsByGroup(ctx context.Context, accountID int64, groupID string) ([]*Item, error) {
 	return s.queryItems(ctx, `account_id = ? AND group_id = ? ORDER BY id`, accountID, groupID)
+}
+
+// ItemsByGoogleIDAny returns the original (else any) item of a Google id, or nil.
+func (s *Store) ItemsByGoogleIDAny(ctx context.Context, accountID int64, googleID string) (*Item, error) {
+	items, err := s.ItemsByGoogleID(ctx, accountID, googleID)
+	if err != nil || len(items) == 0 {
+		return nil, err
+	}
+	for _, it := range items {
+		if it.Variant == "original" {
+			return it, nil
+		}
+	}
+	return items[0], nil
 }
 
 // ItemsByGoogleID returns the items sharing a Google id in an account.
@@ -1163,6 +1183,12 @@ func (s *Store) SetOccurrenceItem(ctx context.Context, id, itemID int64, state s
 	return err
 }
 
+// SetOccurrencesVariant records a changed variant of an item on its occurrences.
+func (s *Store) SetOccurrencesVariant(ctx context.Context, itemID int64, variant string) error {
+	_, err := s.q.ExecContext(ctx, `UPDATE occurrences SET variant = ? WHERE item_id = ?`, variant, itemID)
+	return err
+}
+
 // MoveOccurrences re-points all occurrences of one item to another.
 func (s *Store) MoveOccurrences(ctx context.Context, fromItem, toItem int64) error {
 	// occurrences waiting for their part's replacement, or dropped by one, keep that state
@@ -1197,29 +1223,204 @@ func (s *Store) HasActiveOccurrence(ctx context.Context, albumID, itemID int64) 
 
 // ---- pending sidecars -----------------------------------------------------
 
-// PutPendingSidecar stores a sidecar whose media has not been seen yet.
-func (s *Store) PutPendingSidecar(ctx context.Context, accountID int64, exportID string, partNo int, folder, key string, raw []byte) error {
-	_, err := s.q.ExecContext(ctx, `INSERT INTO pending_sidecars(account_id, export_id, part_no, folder, media_key, json) VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(account_id, export_id, folder, media_key) DO UPDATE SET json = excluded.json, part_no = excluded.part_no`, accountID, exportID, partNo, folder, key, raw)
+// PutPendingSidecar stores a sidecar whose media has not been seen yet. A
+// stored row keeps its consumption state (resolved, the deferred entry) only
+// while the same part stores the same payload again; another sidecar under
+// the key, or one from another part, starts afresh.
+func (s *Store) PutPendingSidecar(ctx context.Context, accountID int64, exportID string, partNo int, folder, key string, raw []byte, googleID string) error {
+	_, err := s.q.ExecContext(ctx, `INSERT INTO pending_sidecars(account_id, export_id, part_no, folder, media_key, json, google_id) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(account_id, export_id, folder, media_key) DO UPDATE SET
+		  resolved = CASE WHEN pending_sidecars.json = excluded.json AND pending_sidecars.part_no IS excluded.part_no THEN pending_sidecars.resolved ELSE 0 END,
+		  deferred_entry = CASE WHEN pending_sidecars.json = excluded.json AND pending_sidecars.part_no IS excluded.part_no THEN pending_sidecars.deferred_entry ELSE NULL END,
+		  deferred_variant = CASE WHEN pending_sidecars.json = excluded.json AND pending_sidecars.part_no IS excluded.part_no THEN pending_sidecars.deferred_variant ELSE NULL END,
+		  deferred_still = CASE WHEN pending_sidecars.json = excluded.json AND pending_sidecars.part_no IS excluded.part_no THEN pending_sidecars.deferred_still ELSE NULL END,
+		  json = excluded.json, part_no = excluded.part_no, google_id = excluded.google_id`,
+		accountID, exportID, partNo, folder, key, raw, nullStr(googleID))
+	return err
+}
+
+// DeferPendingSidecar records that a stored sidecar was related by a name
+// heuristic to a media entry of its folder (with the variant and group still
+// that match implied) while the photo it names was already known with other
+// bytes. The row is reopened (a sidecar already consumed as an album
+// membership included): ResolvePending decides the entry once the export
+// shows whether the photo was delivered elsewhere.
+func (s *Store) DeferPendingSidecar(ctx context.Context, accountID int64, exportID, folder, key, entry, variant, still string) error {
+	_, err := s.q.ExecContext(ctx, `UPDATE pending_sidecars SET deferred_entry = ?, deferred_variant = ?, deferred_still = ?, resolved = 0
+		WHERE account_id = ? AND export_id = ? AND folder = ? AND media_key = ?`, entry, variant, still, accountID, exportID, folder, key)
 	return err
 }
 
 // GetPendingSidecar returns a stored sidecar or nil.
 // PendingSidecar is a stored sidecar with the part that stored it.
 type PendingSidecar struct {
-	Raw    []byte
-	PartNo int
+	Raw      []byte
+	PartNo   int
+	Resolved bool // already consumed: applied to media named after its title, or an album membership
 }
 
 func (s *Store) GetPendingSidecar(ctx context.Context, accountID int64, exportID, folder, key string) (*PendingSidecar, error) {
 	var p PendingSidecar
 	var part sql.NullInt64
-	err := s.q.QueryRowContext(ctx, `SELECT json, part_no FROM pending_sidecars WHERE account_id = ? AND export_id = ? AND folder = ? AND media_key = ?`, accountID, exportID, folder, key).Scan(&p.Raw, &part)
+	err := s.q.QueryRowContext(ctx, `SELECT json, part_no, resolved FROM pending_sidecars WHERE account_id = ? AND export_id = ? AND folder = ? AND media_key = ?`, accountID, exportID, folder, key).Scan(&p.Raw, &part, &p.Resolved)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	p.PartNo = int(part.Int64)
 	return &p, err
+}
+
+// pendingFoundSQL, correlated to a pending_sidecars row p, finds an ingested
+// occurrence of the media the row waits for: the same name in the same folder
+// of the same export, or (for a key without extension, a sidecar named after
+// a title) a name whose stem is the key. Occurrences waiting for or dropped
+// by a replacement do not count.
+const pendingFoundSQL = `SELECT 1 WHERE p.resolved = 1 OR EXISTS (
+	SELECT 1 FROM occurrences o JOIN items i ON i.id = o.item_id
+	 WHERE o.account_id = p.account_id AND o.export_id = p.export_id
+	   AND o.folder = p.folder AND o.state NOT IN ('reset', 'removed')
+	   AND o.entry_name = p.media_key COLLATE NOCASE
+	   AND (p.google_id IS NULL OR i.google_id = p.google_id))`
+
+// MoveFolderOccurrences re-attaches an export folder's occurrences from one
+// album to another (metadata in a later part resolved the folder to a
+// different album than a guess by name) and returns the items concerned.
+func (s *Store) MoveFolderOccurrences(ctx context.Context, accountID int64, exportID, folder string, from, to int64) ([]int64, error) {
+	rows, err := s.q.QueryContext(ctx, `SELECT DISTINCT item_id FROM occurrences WHERE account_id = ? AND export_id = ? AND folder = ? AND album_id = ? AND item_id IS NOT NULL`, accountID, exportID, folder, from)
+	if err != nil {
+		return nil, err
+	}
+	var items []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	_, err = s.q.ExecContext(ctx, `UPDATE occurrences SET album_id = ? WHERE account_id = ? AND export_id = ? AND folder = ? AND album_id = ?`, to, accountID, exportID, folder, from)
+	return items, err
+}
+
+// SetExportFolderAlbum records which album an export's Takeout folder was
+// attached to (also for folders holding only metadata and sidecars).
+func (s *Store) SetExportFolderAlbum(ctx context.Context, accountID int64, exportID, folder string, albumID int64) error {
+	_, err := s.q.ExecContext(ctx, `INSERT INTO export_folders(account_id, export_id, folder, album_id) VALUES (?, ?, ?, ?)
+		ON CONFLICT(account_id, export_id, folder) DO UPDATE SET album_id = excluded.album_id`, accountID, exportID, folder, albumID)
+	return err
+}
+
+// ExportFolderAlbum returns the album an export's folder was attached to (0 if unknown).
+func (s *Store) ExportFolderAlbum(ctx context.Context, accountID int64, exportID, folder string) (int64, error) {
+	var id int64
+	err := s.q.QueryRowContext(ctx, `SELECT album_id FROM export_folders WHERE account_id = ? AND export_id = ? AND folder = ?`, accountID, exportID, folder).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return id, err
+}
+
+// PhotoDeliveredElsewhereInExport reports whether bytes of a photo (any
+// variant of the Google id) came with an export in a folder or under a name
+// other than the given one: then a sidecar of that name elsewhere in the
+// export is an album entry of the photo, not evidence that a same-named file
+// is a new version of it.
+func (s *Store) PhotoDeliveredElsewhereInExport(ctx context.Context, accountID int64, googleID, exportID, folder, entry string) (bool, error) {
+	var n int
+	err := s.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM occurrences o JOIN items i ON i.id = o.item_id
+		WHERE i.account_id = ? AND i.google_id = ? AND o.export_id = ? AND o.sha256 IS NOT NULL
+		AND o.state NOT IN (?, ?) AND NOT (o.folder = ? AND o.entry_name = ? COLLATE NOCASE)`, accountID, googleID, exportID, OccReset, OccRemoved, folder, entry).Scan(&n)
+	return n > 0, err
+}
+
+// MarkPendingResolved records that a stored sidecar was consumed by media
+// named after its title, or recorded as an album membership.
+func (s *Store) MarkPendingResolved(ctx context.Context, accountID int64, exportID, folder, key string) error {
+	_, err := s.q.ExecContext(ctx, `UPDATE pending_sidecars SET resolved = 1 WHERE account_id = ? AND export_id = ? AND folder = ? AND media_key = ?`, accountID, exportID, folder, key)
+	return err
+}
+
+// AlbumOccurrencesWithoutMembership lists (album, item, export) of active
+// album occurrences that have no direct membership row: links a crashed or
+// failed step left behind, to be made again.
+func (s *Store) AlbumOccurrencesWithoutMembership(ctx context.Context, accountID int64) ([]Occurrence, error) {
+	rows, err := s.q.QueryContext(ctx, `SELECT `+occCols+` FROM occurrences o WHERE o.account_id = ? AND o.album_id IS NOT NULL AND o.item_id IS NOT NULL AND o.active = 1
+		AND o.state NOT IN (?, ?)
+		AND NOT EXISTS (SELECT 1 FROM album_items ai WHERE ai.album_id = o.album_id AND ai.item_id = o.item_id AND ai.direct = 1)
+		ORDER BY o.album_id, o.item_id`, accountID, OccReset, OccRemoved)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Occurrence
+	for rows.Next() {
+		o, err := scanOcc(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *o)
+	}
+	return out, rows.Err()
+}
+
+// PendingRow is a stored sidecar still waiting, with where it came from.
+type PendingRow struct {
+	Folder string
+	Key    string
+	Raw    []byte
+	PartNo int
+	// the media entry a heuristic match was deferred for (see DeferPendingSidecar)
+	Entry, Variant, Still string
+}
+
+// PendingSidecarsOfExport lists an export's stored sidecars whose media key
+// has no ingested occurrence in their folder yet.
+func (s *Store) PendingSidecarsOfExport(ctx context.Context, accountID int64, exportID string) ([]PendingRow, error) {
+	rows, err := s.q.QueryContext(ctx, `SELECT p.folder, p.media_key, p.json, p.part_no, p.deferred_entry, p.deferred_variant, p.deferred_still
+		FROM pending_sidecars p WHERE p.account_id = ? AND p.export_id = ?
+		AND NOT EXISTS (`+pendingFoundSQL+`)
+		ORDER BY p.folder, p.media_key`, accountID, exportID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingRow
+	for rows.Next() {
+		var r PendingRow
+		var part sql.NullInt64
+		var entry, variant, still sql.NullString
+		if err := rows.Scan(&r.Folder, &r.Key, &r.Raw, &part, &entry, &variant, &still); err != nil {
+			return nil, err
+		}
+		r.PartNo = int(part.Int64)
+		r.Entry, r.Variant, r.Still = entry.String, variant.String, still.String
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ExportsWithPending lists the export ids of an account that still have
+// stored sidecars.
+func (s *Store) ExportsWithPending(ctx context.Context, accountID int64) ([]string, error) {
+	rows, err := s.q.QueryContext(ctx, `SELECT DISTINCT export_id FROM pending_sidecars WHERE account_id = ? ORDER BY export_id`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var e string
+		if err := rows.Scan(&e); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // DeletePendingSidecar removes a stored sidecar.
@@ -1233,10 +1434,7 @@ func (s *Store) CountPendingSidecars(ctx context.Context, accountID int64) (int,
 	// rows are kept for the whole export (companions may still need them);
 	// only those whose own media has not been ingested count as waiting
 	var n int
-	err := s.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_sidecars p WHERE p.account_id = ?
-		AND NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.account_id = p.account_id AND o.export_id = p.export_id
-		                AND o.folder = p.folder AND o.entry_name = p.media_key COLLATE NOCASE AND o.item_id IS NOT NULL
-		                AND o.state NOT IN (?, ?))`, accountID, OccReset, OccRemoved).Scan(&n)
+	err := s.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_sidecars p WHERE p.account_id = ? AND NOT EXISTS (`+pendingFoundSQL+`)`, accountID).Scan(&n)
 	return n, err
 }
 
@@ -1322,7 +1520,7 @@ func (s *Store) Counts(ctx context.Context, accountID int64) (map[string]int, er
 		"albums":           `SELECT COUNT(*) FROM albums WHERE account_id = ?`,
 		"album_links":      `SELECT COUNT(*) FROM album_items ai JOIN albums a ON a.id = ai.album_id WHERE a.account_id = ?`,
 		"archives":         `SELECT COUNT(*) FROM archives WHERE account_id = ?`,
-		"pending_sidecars": `SELECT COUNT(*) FROM pending_sidecars WHERE account_id = ?`,
+		"pending_sidecars": `SELECT COUNT(*) FROM pending_sidecars p WHERE p.account_id = ? AND NOT EXISTS (` + pendingFoundSQL + `)`,
 		"entries_failed":   `SELECT COUNT(*) FROM archive_entries e JOIN archives a ON a.id = e.archive_id WHERE a.account_id = ? AND e.status = 'failed'`,
 		"entries_given_up": `SELECT COUNT(*) FROM archive_entries e JOIN archives a ON a.id = e.archive_id WHERE a.account_id = ? AND e.status = 'given_up'`,
 	}
@@ -1385,8 +1583,11 @@ func (s *Store) DeleteAlbumItemsOfItem(ctx context.Context, itemID int64) error 
 
 // RenameLinkPrefix rewrites album link paths after an album folder rename.
 func (s *Store) RenameLinkPrefix(ctx context.Context, albumID int64, oldPrefix, newPrefix string) error {
+	// SQLite's substr counts characters, Go's len counts bytes: an album name
+	// with non-ASCII letters would otherwise never match its own prefix
+	n := len([]rune(oldPrefix))
 	_, err := s.q.ExecContext(ctx, `UPDATE album_items SET link_path = ? || substr(link_path, ?) WHERE album_id = ? AND substr(link_path, 1, ?) = ?`,
-		newPrefix, len(oldPrefix)+1, albumID, len(oldPrefix), oldPrefix)
+		newPrefix, n+1, albumID, n, oldPrefix)
 	return err
 }
 
@@ -1616,7 +1817,7 @@ func (s *Store) AlbumPathTakenExcept(ctx context.Context, path string, albumID i
 // PendingSidecarsByPrefix returns stored sidecars whose media key (at least 8
 // characters) is a prefix of mediaName, for truncated-name matching.
 func (s *Store) PendingSidecarsByPrefix(ctx context.Context, accountID int64, exportID, folder, mediaName string) (map[string]PendingSidecar, error) {
-	rows, err := s.q.QueryContext(ctx, `SELECT media_key, json, part_no FROM pending_sidecars WHERE account_id = ? AND export_id = ? AND folder = ?
+	rows, err := s.q.QueryContext(ctx, `SELECT media_key, json, part_no, resolved FROM pending_sidecars WHERE account_id = ? AND export_id = ? AND folder = ?
 		AND length(media_key) >= 8 AND substr(lower(?), 1, length(media_key)) = lower(media_key)`, accountID, exportID, folder, mediaName)
 	if err != nil {
 		return nil, err
@@ -1627,7 +1828,7 @@ func (s *Store) PendingSidecarsByPrefix(ctx context.Context, accountID int64, ex
 		var k string
 		var p PendingSidecar
 		var part sql.NullInt64
-		if err := rows.Scan(&k, &p.Raw, &part); err != nil {
+		if err := rows.Scan(&k, &p.Raw, &part, &p.Resolved); err != nil {
 			return nil, err
 		}
 		p.PartNo = int(part.Int64)

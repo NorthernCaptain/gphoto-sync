@@ -309,6 +309,9 @@ func printResult(r *ingest.Result) {
 	if r.Unlinked > 0 {
 		fmt.Printf("  %d album links removed: no ingested part lists them any more\n", r.Unlinked)
 	}
+	if r.SidecarLinks > 0 {
+		fmt.Printf("  %d album links from sidecar-only album entries\n", r.SidecarLinks)
+	}
 	if r.SidecarsOrphaned > 0 {
 		fmt.Printf("  %d sidecars this part supplied before are missing from its replacement (metadata kept, provenance cleared)\n", r.SidecarsOrphaned)
 	}

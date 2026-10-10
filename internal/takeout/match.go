@@ -19,6 +19,15 @@ type Match struct {
 	// Still is the media name the sidecar primarily describes (differs from
 	// the looked-up name for edited and motion variants).
 	Still string
+	// Heuristic is set when the sidecar relates to the media by a name
+	// heuristic rather than its full name: a title-named sidecar (stem), a
+	// sidecar whose title equals the media name, or a truncated-name prefix.
+	// Such an identity is only trusted when it does not contradict a photo
+	// already known under that Google id.
+	Heuristic bool
+	// Settled is set when the sidecar came from the pending store and had
+	// already been consumed as an album-only membership of the photo it names.
+	Settled bool
 	// Key is the media key the sidecar was registered under (for pending storage).
 	Key string
 }
@@ -81,6 +90,28 @@ type Index struct {
 	stems   []stemEntry
 	used    map[*Sidecar]bool
 	all     []indexed
+	media   map[string][]string // lower(stem) -> media names of the folder sharing it
+}
+
+// AddMedia registers a media file name of the folder, for the rules that
+// need to know what else shares a name.
+func (ix *Index) AddMedia(mediaBase string) {
+	root, _ := SplitExt(mediaBase)
+	ix.media[strings.ToLower(root)] = append(ix.media[strings.ToLower(root)], mediaBase)
+}
+
+// StemCandidates lists the folder's media files whose stem is key.
+func (ix *Index) StemCandidates(key string) []string { return ix.media[strings.ToLower(key)] }
+
+// HasTitleKeys reports whether any registered sidecar is named after a title
+// rather than a media file.
+func (ix *Index) HasTitleKeys() bool {
+	for _, e := range ix.all {
+		if IsTitleKey(e.key) {
+			return true
+		}
+	}
+	return false
 }
 
 type indexed struct {
@@ -90,7 +121,7 @@ type indexed struct {
 
 // NewIndex creates an empty index.
 func NewIndex() *Index {
-	return &Index{exact: map[string]indexed{}, byTitle: map[string][]indexed{}, used: map[*Sidecar]bool{}}
+	return &Index{exact: map[string]indexed{}, byTitle: map[string][]indexed{}, used: map[*Sidecar]bool{}, media: map[string][]string{}}
 }
 
 // Add registers a sidecar under the media names it describes.
@@ -132,6 +163,16 @@ func (ix *Index) Lookup(mediaBase string) (Match, bool) {
 			return Match{Sidecar: e.sc, Variant: VariantEdited, Still: orig, Key: e.key}, true
 		}
 	}
+	// a sidecar named after a title that has no extension ("11_16_12 - 1.json"
+	// for "11_16_12 - 1.jpg": Takeout appends the extension to the media only)
+	if root, ext := SplitExt(mediaBase); ext != "" {
+		if e, ok := ix.exact[strings.ToLower(root)]; ok && IsTitleKey(e.key) {
+			if variant, still, ok := StemRole(mediaBase, ix.StemCandidates(root)); ok {
+				ix.used[e.sc] = true
+				return Match{Sidecar: e.sc, Variant: variant, Still: still, Key: e.key, Heuristic: true}, true
+			}
+		}
+	}
 	// companion: PXL_x.MP -> PXL_x.MP.jpg ; IMG_1.MOV -> IMG_1.HEIC
 	for _, still := range CompanionStills(mediaBase) {
 		if e, ok := ix.exact[strings.ToLower(still)]; ok {
@@ -142,7 +183,7 @@ func (ix *Index) Lookup(mediaBase string) (Match, bool) {
 	// title equals the media name and is unique
 	if cands := ix.byTitle[lb]; len(cands) == 1 && !ix.used[cands[0].sc] {
 		ix.used[cands[0].sc] = true
-		return Match{Sidecar: cands[0].sc, Variant: VariantOriginal, Still: mediaBase, Key: cands[0].key}, true
+		return Match{Sidecar: cands[0].sc, Variant: VariantOriginal, Still: mediaBase, Key: cands[0].key, Heuristic: true}, true
 	}
 	// truncated media name: the sidecar stem is a prefix of the media name
 	var best *stemEntry
@@ -158,7 +199,7 @@ func (ix *Index) Lookup(mediaBase string) (Match, bool) {
 	}
 	if best != nil && n == 1 {
 		ix.used[best.sc] = true
-		return Match{Sidecar: best.sc, Variant: VariantOriginal, Still: mediaBase, Key: best.key}, true
+		return Match{Sidecar: best.sc, Variant: VariantOriginal, Still: mediaBase, Key: best.key, Heuristic: true}, true
 	}
 	return Match{}, false
 }
@@ -251,7 +292,86 @@ func LookupKeys(mediaBase string) []struct {
 	for _, s := range CompanionStills(mediaBase) {
 		out = append(out, k{s, VariantMotion, s})
 	}
+	if root, ext := SplitExt(mediaBase); ext != "" {
+		// a sidecar named after a title without extension; the caller settles
+		// the variant with StemRole against the folder's media
+		out = append(out, k{root, VariantOriginal, mediaBase})
+	}
 	return out
+}
+
+// IsStemKey reports whether a lookup key is the media's stem, i.e. the
+// candidate for a sidecar named after a title without extension.
+func IsStemKey(mediaBase, key string) bool {
+	root, ext := SplitExt(mediaBase)
+	return ext != "" && strings.EqualFold(root, key)
+}
+
+var videoExts = map[string]bool{".mp4": true, ".mov": true, ".mp": true, ".mv": true, ".m4v": true, ".3gp": true, ".avi": true, ".webm": true, ".mkv": true}
+var otherMediaExts = map[string]bool{".gif": true, ".tif": true, ".tiff": true, ".bmp": true, ".heif": true, ".avif": true, ".jpe": true, ".jfif": true, ".raw": true, ".orf": true, ".rw2": true, ".pef": true, ".srw": true}
+
+// HasMediaExt reports whether a name ends in a known media extension.
+func HasMediaExt(name string) bool {
+	return isStill(name) || isVideo(name) || otherMediaExts[strings.ToLower(func() string { _, e := SplitExt(name); return e }())]
+}
+
+// IsStillName and IsVideoName classify a media file name by its extension.
+func IsStillName(name string) bool { return isStill(name) }
+func IsVideoName(name string) bool { return isVideo(name) }
+
+// IsTitleKey reports whether a sidecar key names a title rather than a media
+// file: it does not end in a media extension (a title may contain dots).
+func IsTitleKey(key string) bool { return !HasMediaExt(key) }
+
+func isStill(name string) bool {
+	_, ext := SplitExt(name)
+	for _, se := range stillExts {
+		if strings.EqualFold(ext, se) {
+			return true
+		}
+	}
+	return false
+}
+
+func isVideo(name string) bool {
+	_, ext := SplitExt(name)
+	return videoExts[strings.ToLower(ext)]
+}
+
+// StemRole tells what a media file is when a sidecar named after a title
+// without extension describes it, given every file of the folder sharing
+// that stem (cands, which includes mediaBase): alone, the file is the
+// original (or the edited variant); a still with one video are the original
+// and its motion companion, whichever the archive lists first; anything else
+// (two stills, two videos, three files) is ambiguous and not matched.
+func StemRole(mediaBase string, cands []string) (variant, still string, ok bool) {
+	switch len(cands) {
+	case 0, 1:
+		if orig, edited := IsEdited(mediaBase); edited {
+			return VariantEdited, orig, true
+		}
+		return VariantOriginal, mediaBase, true
+	case 2:
+		var stillName, videoName string
+		for _, c := range cands {
+			switch {
+			case isStill(c) && stillName == "":
+				stillName = c
+			case isVideo(c) && videoName == "":
+				videoName = c
+			default:
+				return "", "", false
+			}
+		}
+		if stillName == "" || videoName == "" {
+			return "", "", false
+		}
+		if strings.EqualFold(mediaBase, videoName) {
+			return VariantMotion, stillName, true
+		}
+		return VariantOriginal, stillName, true
+	}
+	return "", "", false
 }
 
 // MarkUsed records that a sidecar was consumed (e.g. by promoting an item).

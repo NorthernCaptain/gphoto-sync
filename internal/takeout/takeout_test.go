@@ -108,6 +108,11 @@ func TestLookupKeys(t *testing.T) {
 	if keys[0].Variant != VariantOriginal || len(keys) < 2 || keys[1].Variant != VariantMotion {
 		t.Errorf("motion lookup keys: %+v", keys)
 	}
+	// a sidecar named after a title without extension is the last candidate
+	keys = LookupKeys("11_16_12 - 1.jpg")
+	if last := keys[len(keys)-1]; last.Key != "11_16_12 - 1" || last.Variant != VariantOriginal {
+		t.Errorf("stem lookup key: %+v", keys)
+	}
 }
 
 func TestParseAlbumMeta(t *testing.T) {

@@ -183,6 +183,21 @@ func cmdExports(ctx context.Context, args []string) int {
 		return fatal(err)
 	}
 	fmt.Printf("export %s of %s: confirmed %d parts\n", *exportID, *account, *parts)
+	// with every confirmed part ingested the export is complete: stored
+	// sidecars still undecided (name collisions with known photos) are settled
+	complete, err := e.ing.ExportComplete(ctx, acct.ID, *exportID, 0, time.Now())
+	if err != nil {
+		return fatal(err)
+	}
+	if !complete {
+		fmt.Println("  not every confirmed part is ingested yet; stored sidecars are settled by the sync that ingests the last one")
+		return ExitOK
+	}
+	if links, promoted, err := e.ing.ResolvePending(ctx, acct, *exportID, true); err != nil {
+		return fatal(err)
+	} else if links+promoted > 0 {
+		fmt.Printf("  %d album links and %d promotions from stored sidecars\n", links, promoted)
+	}
 	return ExitOK
 }
 

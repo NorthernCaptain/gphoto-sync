@@ -164,6 +164,15 @@ func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *Acco
 		byName[f.Name]++
 		parts = append(parts, f)
 	}
+	// every part Drive lists for an export is evidence against its completeness
+	// until this run confirms it ingested (a duplicate name, a part still
+	// settling, a replacement not yet ingested, a fetch or ingest failure, a
+	// part with errors all keep the export open; see ResolvePending)
+	outstanding := map[string]int{}
+	for _, f := range parts {
+		e, _, _ := ingest.ParsePartName(f.Name)
+		outstanding[e]++
+	}
 	var usable []rclone.RemoteFile
 	for _, f := range parts {
 		if byName[f.Name] > 1 {
@@ -240,8 +249,10 @@ func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *Acco
 			r.Log.Warn("part on Drive is not the recorded one", "name", f.Name, "why", why, "status", arch.Status)
 		case dispSkipUnverified:
 			ar.Notes = append(ar.Notes, fmt.Sprintf("%s was ingested from another copy whose hash is unknown: left on Drive", f.Name))
+			outstanding[exportID]--
 			continue
 		case dispSkipIngested:
+			outstanding[exportID]--
 			if arch.RemoteID != f.ID && !dryRun {
 				// the same content under a new id: the old file's deletion, if still
 				// owed (staged by a run whose delete failed), must be finished first,
@@ -332,6 +343,7 @@ func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *Acco
 		case store.ArchiveWithErrors:
 			ar.Exit = Worst(ar.Exit, ExitUnresolved)
 		case store.ArchiveIngested:
+			outstanding[exportID]--
 			if !r.Cfg.Takeout.KeepArchives {
 				if err := os.Remove(local); err != nil && !errors.Is(err, os.ErrNotExist) {
 					r.Log.Warn("could not remove local part", "path", local, "err", err)
@@ -350,6 +362,32 @@ func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *Acco
 	// folder (files already staged are finished even with deletion turned off)
 	if !dryRun && acct.ID != 0 {
 		r.finishStagedDeletes(ctx, ar, acct.ID, acc.RcloneRemote, files)
+	}
+
+	// sidecars still waiting in album folders may describe photos that
+	// arrived since (or, after an upgrade, photos ingested earlier)
+	if !dryRun && acct.ID != 0 {
+		if exps, err := r.St.ExportsWithPending(ctx, acct.ID); err == nil {
+			for _, e := range exps {
+				// name collisions with known photos are decided for good only once
+				// the export is complete, and nothing Drive lists for it is left
+				// unconfirmed by this run
+				complete, err := r.Ing.ExportComplete(ctx, acct.ID, e, r.Cfg.Takeout.ExportCompleteAfter, r.Now())
+				if err != nil {
+					ar.problem(fmt.Sprintf("completeness of %s: %v", e, err))
+					continue
+				}
+				complete = complete && outstanding[e] == 0
+				links, promoted, err := r.Ing.ResolvePending(ctx, acct, e, complete)
+				if err != nil {
+					ar.problem(fmt.Sprintf("resolve pending sidecars of %s: %v", e, err))
+					continue
+				}
+				if links+promoted > 0 {
+					ar.Notes = append(ar.Notes, fmt.Sprintf("%s: %d album links and %d promotions from sidecars that found their photo", e, links, promoted))
+				}
+			}
+		}
 	}
 
 	// album pruning for exports whose complete listing is confirmed
@@ -768,6 +806,9 @@ func (rep *Report) HTML() string {
 				esc(r.Part), esc(r.Status), r.Added, r.Duplicates, r.Changed, r.Promoted, r.Links, r.Failed+r.GivenUp, r.PendingSidecars, esc(r.Duration.Round(time.Second).String()))
 			if r.Versioned > 0 {
 				fmt.Fprintf(&b, "   older export: %d files kept as versions, current content untouched\n", r.Versioned)
+			}
+			if r.SidecarLinks > 0 {
+				fmt.Fprintf(&b, "   %d album links from sidecar-only album entries\n", r.SidecarLinks)
 			}
 			for i, e := range r.Errors {
 				if i >= 5 {

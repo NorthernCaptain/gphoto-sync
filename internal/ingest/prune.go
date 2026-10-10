@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"time"
 
 	"gphoto-sync/internal/fsops"
 	"gphoto-sync/internal/store"
@@ -211,11 +212,41 @@ func (pr *partRun) recomputeGroup(album *store.Album, still *store.Item) (int, e
 // replacement still in progress wait for that part (completingArchive is the
 // part finishing now, whose replacement this call completes).
 func (ing *Ingester) ReconcileMemberships(ctx context.Context, acct *store.Account, completingArchive int64) (removed int, err error) {
+	pr := &partRun{ing: ing, ctx: ctx, acct: acct}
+	// the other direction first: active album occurrences whose link a failed
+	// or interrupted step never made (or made in another album before the
+	// folder moved) get their link now
+	missing, err := ing.st.AlbumOccurrencesWithoutMembership(ctx, acct.ID)
+	if err != nil {
+		return 0, err
+	}
+	for _, o := range missing {
+		album, err := ing.st.GetAlbum(ctx, o.AlbumID)
+		if err != nil {
+			return 0, err
+		}
+		item, err := ing.st.GetItem(ctx, o.ItemID)
+		if err != nil {
+			return 0, err
+		}
+		if album == nil || item == nil {
+			continue
+		}
+		pr.part = PartMeta{Account: acct.Name, ExportID: o.ExportID, PartNo: o.PartNo, Name: "reconcile"}
+		if _, err := pr.ensureDirectConfirmed(album, item, o.ExportID); err != nil {
+			return 0, fmt.Errorf("link %s into %s: %w", item.LibPath, album.Path, err)
+		}
+		if err := pr.retireOccurrences(album, item); err != nil {
+			return 0, err
+		}
+		if err := pr.ensureGroupLinks(item); err != nil {
+			return 0, err
+		}
+	}
 	rows, err := ing.st.UnsupportedDirectMemberships(ctx, acct.ID, completingArchive)
 	if err != nil || len(rows) == 0 {
 		return 0, err
 	}
-	pr := &partRun{ing: ing, ctx: ctx, acct: acct}
 	for _, row := range rows {
 		album, err := ing.st.GetAlbum(ctx, row.AlbumID)
 		if err != nil {
@@ -261,6 +292,38 @@ func (ing *Ingester) PrunableExports(ctx context.Context, account string) ([]str
 		}
 	}
 	return out, nil
+}
+
+// ExportComplete reports whether an export delivered everything it will:
+// every part seen so far is ingested with no gap in the numbering, and either
+// the confirmed part count is reached or no new part was seen for quiet
+// (0: a confirmation is required). Decisions that cannot be undone wait for
+// it.
+func (ing *Ingester) ExportComplete(ctx context.Context, accountID int64, exportID string, quiet time.Duration, now time.Time) (bool, error) {
+	exp, err := ing.st.GetExport(ctx, accountID, exportID)
+	if err != nil || exp == nil || exp.HighestPart == 0 {
+		return false, err
+	}
+	archs, err := ing.st.ArchivesOfExport(ctx, accountID, exportID)
+	if err != nil {
+		return false, err
+	}
+	ingested := map[int]bool{}
+	for _, a := range archs {
+		if a.Status != store.ArchiveIngested {
+			return false, nil
+		}
+		ingested[a.PartNo] = true
+	}
+	for p := 1; p <= exp.HighestPart; p++ {
+		if !ingested[p] {
+			return false, nil
+		}
+	}
+	if exp.ConfirmedParts > 0 {
+		return exp.HighestPart == exp.ConfirmedParts, nil
+	}
+	return quiet > 0 && exp.LastPartSeenAt != "" && now.Sub(store.ParseTime(exp.LastPartSeenAt)) > quiet, nil
 }
 
 var _ = fsops.Unlink

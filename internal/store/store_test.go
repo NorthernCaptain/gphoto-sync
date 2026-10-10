@@ -116,3 +116,128 @@ func TestArchiveLookupIsPerAccount(t *testing.T) {
 		t.Errorf("owner lookup: %+v", a)
 	}
 }
+
+// Renaming an album's link paths must work for names with non-ASCII letters
+// (SQLite substr counts characters, not bytes).
+func TestRenameLinkPrefixNonASCII(t *testing.T) {
+	ctx := context.Background()
+	d, err := db.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	st := New(d)
+	acct, _ := st.EnsureAccount(ctx, "leo", "r:")
+	b, _ := st.InsertBlob(ctx, "s", 1, "leo/library/2016/04/a.jpg")
+	itemID, err := st.InsertItem(ctx, &Item{AccountID: acct.ID, BlobID: b.ID, Variant: "original", IdentityKey: "k", IdentitySrc: IdentityGoogle, Filename: "a.jpg", Ext: ".jpg", LibPath: "leo/library/2016/04/a.jpg", GroupID: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	albumID, err := st.InsertAlbum(ctx, &Album{AccountID: acct.ID, Title: "Spotlight on Андрейка", TakeoutFolder: "Spotlight on Андрейка(1)", Path: "leo/albums/Spotlight on Андрейка(1)", Kind: "own"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := "leo/albums/Spotlight on Андрейка(1)/a.jpg"
+	if err := st.UpsertAlbumItem(ctx, &AlbumItem{AlbumID: albumID, ItemID: itemID, LinkPath: old, Direct: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RenameLinkPrefix(ctx, albumID, "leo/albums/Spotlight on Андрейка(1)/", "leo/albums/Spotlight on Андрейка~6acaacac/"); err != nil {
+		t.Fatal(err)
+	}
+	ai, _ := st.GetAlbumItem(ctx, albumID, itemID)
+	if ai == nil || ai.LinkPath != "leo/albums/Spotlight on Андрейка~6acaacac/a.jpg" {
+		t.Fatalf("link path after rename: %+v", ai)
+	}
+}
+
+// A same-named media occurrence satisfies a stored sidecar only when it is
+// the photo the sidecar names.
+// A stored sidecar keeps its consumption state only while the same part
+// stores the same payload again.
+func TestPendingUpsertResetsStateOnChange(t *testing.T) {
+	ctx := context.Background()
+	d, err := db.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	st := New(d)
+	acct, _ := st.EnsureAccount(ctx, "leo", "r:")
+	raw1, raw2 := []byte(`{"title":"a"}`), []byte(`{"title":"b"}`)
+	put := func(part int, raw []byte) {
+		t.Helper()
+		if err := st.PutPendingSidecar(ctx, acct.ID, "e-1", part, "Trip", "a.jpg", raw, "AAA"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state := func() (bool, string) {
+		t.Helper()
+		p, err := st.GetPendingSidecar(ctx, acct.ID, "e-1", "Trip", "a.jpg")
+		if err != nil || p == nil {
+			t.Fatalf("row: %v %v", p, err)
+		}
+		rows, _ := st.PendingSidecarsOfExport(ctx, acct.ID, "e-1")
+		entry := "(hidden)"
+		for _, r := range rows {
+			entry = r.Entry
+		}
+		return p.Resolved, entry
+	}
+	put(1, raw1)
+	if err := st.MarkPendingResolved(ctx, acct.ID, "e-1", "Trip", "a.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	put(1, raw1)
+	if resolved, _ := state(); !resolved {
+		t.Error("the same payload from the same part lost the resolved flag")
+	}
+	put(2, raw1)
+	if resolved, _ := state(); resolved {
+		t.Error("another part's copy kept the resolved flag")
+	}
+	if err := st.DeferPendingSidecar(ctx, acct.ID, "e-1", "Trip", "a.jpg", "a.jpg", "original", "a.jpg"); err != nil {
+		t.Fatal(err)
+	}
+	put(2, raw1)
+	if _, entry := state(); entry != "a.jpg" {
+		t.Errorf("the same payload lost its deferred entry: %q", entry)
+	}
+	put(2, raw2)
+	if resolved, entry := state(); resolved || entry != "" {
+		t.Errorf("a changed payload kept its state: resolved=%v entry=%q", resolved, entry)
+	}
+}
+
+func TestPendingFoundOnlyByNamedPhoto(t *testing.T) {
+	ctx := context.Background()
+	d, err := db.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	st := New(d)
+	acct, _ := st.EnsureAccount(ctx, "leo", "r:")
+	b, _ := st.InsertBlob(ctx, "s", 1, "leo/library/2016/04/c.jpg")
+	other, _ := st.InsertItem(ctx, &Item{AccountID: acct.ID, BlobID: b.ID, GoogleID: "CC2", Variant: "original", IdentityKey: "CC2#original", IdentitySrc: IdentityGoogle, Filename: "c.jpg", Ext: ".jpg", LibPath: "leo/library/2016/04/c.jpg", GroupID: "CC2#original"})
+	if _, err := st.UpsertOccurrence(ctx, &Occurrence{AccountID: acct.ID, ExportID: "e-1", PartNo: 1, Folder: "Trip", EntryName: "c.jpg", Variant: "original", SHA256: "s", ItemID: other, State: OccResolved}); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"title":"c.jpg","url":"https://photos.google.com/photo/CCC"}`)
+	if err := st.PutPendingSidecar(ctx, acct.ID, "e-1", 2, "Trip", "c.jpg", raw, "CCC"); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := st.PendingSidecarsOfExport(ctx, acct.ID, "e-1")
+	if len(rows) != 1 {
+		t.Fatalf("sidecar naming another photo hidden by a same-named file: %+v", rows)
+	}
+	if n, _ := st.CountPendingSidecars(ctx, acct.ID); n != 1 {
+		t.Errorf("count: %d", n)
+	}
+	// the same row for the photo that is there: found
+	if err := st.PutPendingSidecar(ctx, acct.ID, "e-1", 2, "Trip", "c.jpg", raw, "CC2"); err != nil {
+		t.Fatal(err)
+	}
+	if rows, _ := st.PendingSidecarsOfExport(ctx, acct.ID, "e-1"); len(rows) != 0 {
+		t.Errorf("sidecar of the present photo still listed: %+v", rows)
+	}
+}

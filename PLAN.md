@@ -52,6 +52,20 @@ one official path that delivers originals: **Google Takeout → Google Drive →
 - **Known quirks** an ingester must handle, verified on 2026-10-06 against part 1 of the
   real export (33,096 entries, 13,352 media, 19,744 sidecars, 26 year folders, 112 album
   folders, all entries deflate-compressed, 314 non-ASCII names):
+  - album folders do **not** always hold the media: for many members Takeout writes only
+    the sidecar JSON into the album folder while the file itself sits in its year folder
+    (844 of 43,591 items in the 2026-10-07 export). Such a sidecar-only entry is an album
+    membership of the item its Google id names (`ResolvePending`, run after every part and
+    at the end of every sync), recorded as an occurrence without bytes.
+  - some sidecars are named after the photo's title without extension (`11_16_12 - 1.json`
+    next to `11_16_12 - 1.jpg`, title `11/16/12 - 1`): a key without extension matches the
+    media whose stem it equals, when exactly one does (or a still with its video; a lone
+    video is the original until its still arrives, then its motion companion). A file
+    related to a sidecar by name alone whose Google id is a photo already known with other
+    bytes is kept nameless until the export decides it: the photo delivered elsewhere in the
+    export makes the sidecar an album entry of that photo, a complete export (all parts
+    ingested and either the confirmed count reached or no new part for
+    `export_complete_after`) without it makes the file the photo's new version.
   - duplicate names become `IMG_1(1).jpg`; the sidecar is
     `IMG_1.jpg.supplemental-metadata(1).json` in current exports (the `(n)` moves to the
     end of the sidecar name) and `IMG_1.jpg(1).json` in older ones; both styles are matched;
@@ -542,6 +556,7 @@ album_items  (album_id, item_id, link_path, direct, confirmed_export_id, confirm
               PRIMARY KEY(album_id, item_id))
 item_versions (item_id, blob_id, path, superseded_at, by_export_id)   -- kept files of re-edited items
 albums_full  (album_id, listing_export_id)        -- newest complete listing applied per album
+export_folders (account_id, export_id, folder, album_id)   -- album each export's Takeout folder went to
 exports_order: export ids compare by timestamp, then numeric sequence; never as strings
 archives     (account_id, remote_id UNIQUE, name, export_id, part_no, size, md5, status
               {seen,fetching,ingesting,ingested,partial,ingested_with_errors,failed},
@@ -551,9 +566,13 @@ archive_entries (archive_id, entry_name, status {done,skipped,failed,given_up}, 
               last_error)                        -- resume inside a part, retry failed entries
 exports      (account_id, export_id, highest_part, confirmed_parts, last_part_seen_at,
               complete_at, authoritative, albums_pruned_at)   -- completeness + pruning rights, see 3.3
-pending_sidecars (account_id, export_id, part_no, folder, media_key, json,
+pending_sidecars (account_id, export_id, part_no, folder, media_key, json, google_id, resolved,
+              deferred_entry, deferred_variant, deferred_still,
               PRIMARY KEY(account_id, export_id, folder, media_key))   -- sidecars seen before their media;
-                                                                      -- part_no: who stored it (dropped when that part is replaced)
+                                                                      -- part_no: who stored it (dropped when that part is replaced);
+                                                                      -- resolved: consumed (applied, or an album membership);
+                                                                      -- deferred_*: the entry a name heuristic related it to while
+                                                                      --   its photo was known with other bytes (decided at completion)
 runs         (account_id, started, finished, exit_code, counts JSON)
 errors       (ts, account_id, ref, message)
 telegram_chats (chat_id PRIMARY KEY, user_id, username, display_name, paired_at, revoked_at)

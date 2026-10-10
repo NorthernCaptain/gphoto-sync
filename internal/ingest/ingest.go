@@ -104,6 +104,7 @@ type Result struct {
 	Replaced         bool // an earlier ingest of this part was forgotten before this one
 	Unlinked         int  // album links removed because no ingested part lists them any more
 	SidecarsOrphaned int  // stored sidecars this part supplied before but no longer carries
+	SidecarLinks     int  // album links made from sidecars whose photo lives in another folder
 	Promoted         int
 	Merged           int
 	Links            int
@@ -145,6 +146,53 @@ type folderCtx struct {
 	meta     *takeout.AlbumMeta
 	album    *store.Album
 	hasMedia bool
+	// lower(stem) -> names of media already ingested in this folder of the
+	// export, loaded once on first use (the producer and the commit loop both
+	// ask for it)
+	occOnce  sync.Once
+	occStems map[string][]string
+	occErr   error
+}
+
+// sidecarOnlyPrefix marks the occurrence recorded for an album entry that
+// Takeout delivered as a sidecar only (the photo lives in another folder):
+// evidence of membership kept apart from any media file of that name.
+const sidecarOnlyPrefix = "sidecar:"
+
+func isSidecarOnlyEntry(name string) bool { return strings.HasPrefix(name, sidecarOnlyPrefix) }
+
+// stemCandidates lists every media file of the folder sharing a stem: those
+// in this part and those ingested from earlier parts of the export, so a
+// sidecar named after a title is never handed to a second, unrelated file.
+func (pr *partRun) stemCandidates(fc *folderCtx, key string) ([]string, error) {
+	fc.occOnce.Do(func() {
+		stems := map[string][]string{}
+		occs, err := pr.ing.st.OccurrencesInFolder(pr.ctx, pr.acct.ID, pr.part.ExportID, fc.name)
+		if err != nil {
+			fc.occErr = err
+			return
+		}
+		for _, o := range occs {
+			if o.ItemID == 0 || o.State == store.OccReset || o.State == store.OccRemoved || isSidecarOnlyEntry(o.EntryName) {
+				continue
+			}
+			root, _ := takeout.SplitExt(o.EntryName)
+			stems[strings.ToLower(root)] = append(stems[strings.ToLower(root)], o.EntryName)
+		}
+		fc.occStems = stems
+	})
+	if fc.occErr != nil {
+		return nil, fc.occErr
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, n := range append(append([]string{}, fc.index.StemCandidates(key)...), fc.occStems[strings.ToLower(key)]...) {
+		if !seen[strings.ToLower(n)] {
+			seen[strings.ToLower(n)] = true
+			out = append(out, n)
+		}
+	}
+	return out, nil
 }
 
 type job struct {
@@ -184,6 +232,7 @@ type partRun struct {
 
 	prunedListing       string // newest complete listing applied to the account (lazy)
 	prunedListingLoaded bool
+	pendingRejected     map[string]bool // "<folder>/<key>" of stored sidecars a commit refused (another photo's)
 }
 
 // appliedListing returns the newest complete album listing that applies to an
@@ -257,6 +306,10 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 				goodDescriptors = append(goodDescriptors, e.Name)
 			}
 		case takeout.TypeSidecar:
+			if (ce.FolderKind == takeout.FolderTrash && !ing.cfg.Takeout.IncludeTrash) || (ce.FolderKind == takeout.FolderArchive && !ing.cfg.Takeout.IncludeArchive) {
+				pr.res.Skipped++ // its media is skipped too: nothing to wait for
+				continue
+			}
 			raw, err := pr.readSmall(e, 8<<20)
 			if err == nil {
 				var sc *takeout.Sidecar
@@ -284,6 +337,7 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 			}
 			fc := pr.folder(ce)
 			fc.hasMedia = true
+			fc.index.AddMedia(ce.Base)
 			mediaEntries = append(mediaEntries, job{e: e, ce: ce, fc: fc})
 			pr.res.Media++
 		}
@@ -388,6 +442,22 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 		_ = ing.st.SetExportAuthoritative(ctx, acct.ID, part.ExportID)
 	}
 
+	// sidecars named after a title are settled against every media file of the
+	// folder sharing the stem, including those ingested from earlier parts
+	for _, fc := range pr.folders {
+		if fc.index.HasTitleKeys() {
+			occs, err := ing.st.OccurrencesInFolder(ctx, acct.ID, part.ExportID, fc.name)
+			if err != nil {
+				return nil, err
+			}
+			for _, o := range occs {
+				if o.ItemID != 0 && o.State != store.OccReset && o.State != store.OccRemoved && !isSidecarOnlyEntry(o.EntryName) {
+					fc.index.AddMedia(o.EntryName)
+				}
+			}
+		}
+	}
+
 	// albums and late sidecars (media ingested from earlier parts, or from an
 	// earlier run of this part whose sidecar could not be read then)
 	doneMedia := map[string]bool{} // "<folder>/<base>" of media entries finished by an earlier run
@@ -398,9 +468,50 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 	}
 	for _, fc := range pr.folders {
 		if fc.kind == takeout.FolderAlbum && (fc.meta != nil || fc.hasMedia) {
-			a, err := pr.ensureAlbum(fc)
-			if err != nil {
-				return nil, fmt.Errorf("album %q: %w", fc.name, err)
+			// without metadata in this part, the album this export already
+			// attached the folder to wins over a guess by folder name
+			var a *store.Album
+			if fc.meta == nil {
+				if id, err := ing.st.ExportFolderAlbum(ctx, acct.ID, part.ExportID, fc.name); err != nil {
+					return nil, err
+				} else if id != 0 {
+					if a, err = ing.st.GetAlbum(ctx, id); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if a == nil {
+				prevID, err := ing.st.ExportFolderAlbum(ctx, acct.ID, part.ExportID, fc.name)
+				if err != nil {
+					return nil, err
+				}
+				if a, err = pr.ensureAlbum(fc); err != nil {
+					return nil, fmt.Errorf("album %q: %w", fc.name, err)
+				}
+				// the record and the move of what an earlier part attached to an
+				// album guessed by name change together; the links of the moved
+				// items are made (or, after a failure here, made at
+				// reconciliation from the occurrences), the stale ones reconciled away
+				var moved []int64
+				err = ing.st.Tx(ctx, func(tx *store.Store) error {
+					if err := tx.SetExportFolderAlbum(ctx, acct.ID, part.ExportID, fc.name, a.ID); err != nil {
+						return err
+					}
+					if prevID != 0 && prevID != a.ID {
+						if moved, err = tx.MoveFolderOccurrences(ctx, acct.ID, part.ExportID, fc.name, prevID, a.ID); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+				if err != nil {
+					return nil, err
+				}
+				if len(moved) > 0 {
+					if err := pr.linkItemsInto(a, moved); err != nil {
+						return nil, err
+					}
+				}
 			}
 			fc.album = a
 		}
@@ -468,6 +579,19 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 				continue
 			}
 			_ = ing.st.MarkEntry(ctx, arch.ID, x.e.Name, store.EntryDone, 0, "")
+			if x.job.pending != "" && !pr.pendingRejected[x.fc.name+"/"+x.job.pending] {
+				_ = ing.st.MarkPendingResolved(ctx, acct.ID, part.ExportID, x.fc.name, x.job.pending)
+			}
+			if m := x.match; m != nil && m.Heuristic && takeout.IsTitleKey(m.Key) && x.job.pending == "" && !pr.pendingRejected[x.fc.name+"/"+m.Key] {
+				// a title-named sidecar of this part consumed by its media is kept,
+				// as consumed, for the companion a later part may bring (a still
+				// after its lone video, a video after its still)
+				if err := ing.st.PutPendingSidecar(ctx, acct.ID, part.ExportID, pr.sidecarPart(m.Sidecar), x.fc.name, m.Key, m.Sidecar.Raw, m.Sidecar.GoogleID()); err != nil {
+					pr.fail(x.job, err)
+					continue
+				}
+				_ = ing.st.MarkPendingResolved(ctx, acct.ID, part.ExportID, x.fc.name, m.Key)
+			}
 		}
 	}
 	for _, x := range buffered { // only when the context was cancelled mid-way
@@ -483,13 +607,23 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 	for _, fc := range pr.folders {
 		for _, u := range fc.index.Unused() {
 			// media already ingested from another part of this export: nothing to
-			// wait for. An occurrence still waiting for its part's replacement is
-			// as good as absent: the replacement may have moved the media to a
-			// later part, which must find this sidecar
+			// wait for, unless that file is another photo than the one the sidecar
+			// names (then the sidecar is an album entry of the named photo). An
+			// occurrence still waiting for its part's replacement is as good as
+			// absent: the replacement may have moved the media to a later part,
+			// which must find this sidecar
 			if occ, err := ing.st.FindOccurrence(ctx, acct.ID, part.ExportID, fc.name, u.Key); err == nil && occ != nil && occ.ItemID != 0 && occ.State != store.OccReset && occ.State != store.OccRemoved {
-				continue
+				gid := u.SC.GoogleID()
+				if gid == "" {
+					continue
+				}
+				if it, err := ing.st.GetItem(ctx, occ.ItemID); err != nil {
+					return nil, err
+				} else if it == nil || it.GoogleID == gid {
+					continue
+				}
 			}
-			if err := ing.st.PutPendingSidecar(ctx, acct.ID, part.ExportID, part.PartNo, fc.name, u.Key, u.SC.Raw); err != nil {
+			if err := ing.st.PutPendingSidecar(ctx, acct.ID, part.ExportID, part.PartNo, fc.name, u.Key, u.SC.Raw, u.SC.GoogleID()); err != nil {
 				return nil, err
 			}
 			pr.res.PendingSidecars++
@@ -537,6 +671,12 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 	if err := ing.st.FinishArchive(ctx, arch.ID, status, pr.res.Media, counts[store.EntryDone], pr.res.Duplicates, pr.res.Failed+pr.res.GivenUp); err != nil {
 		return nil, err
 	}
+	// sidecars still waiting may now describe photos this part brought
+	links, promoted, err := ing.ResolvePending(ctx, acct, part.ExportID, false)
+	if err != nil {
+		return nil, fmt.Errorf("resolve pending sidecars: %w", err)
+	}
+	pr.res.SidecarLinks, pr.res.Promoted = pr.res.SidecarLinks+links, pr.res.Promoted+promoted
 	_ = os.Remove(ing.abs(pr.tmpDir))
 	pr.res.Duration = time.Since(start)
 	return &pr.res, nil
@@ -602,7 +742,22 @@ func (pr *partRun) resolveSidecar(j job) *takeout.Match {
 			continue
 		}
 		sc.SourcePart = p.PartNo
-		return &takeout.Match{Sidecar: sc, Variant: k.Variant, Still: k.Still, Key: k.Key}
+		variant, still := k.Variant, k.Still
+		byStem := takeout.IsStemKey(j.ce.Base, k.Key)
+		if byStem {
+			// a sidecar named after a title without extension: only for a lone
+			// file or a still with its video, never for two unrelated files
+			// (counting media of earlier parts of the export in the folder)
+			cands, err := pr.stemCandidates(j.fc, k.Key)
+			if err != nil {
+				continue
+			}
+			var ok bool
+			if variant, still, ok = takeout.StemRole(j.ce.Base, cands); !ok {
+				continue
+			}
+		}
+		return &takeout.Match{Sidecar: sc, Variant: variant, Still: still, Key: k.Key, Heuristic: byStem, Settled: pr.settled(j.fc.name, k.Key, *p)}
 	}
 	// a sidecar stored under a truncated media name by an earlier part: the
 	// prefix narrows the candidates, the sidecar's own title (the untruncated
@@ -621,13 +776,25 @@ func (pr *partRun) resolveSidecar(j job) *takeout.Match {
 			if orig, edited := takeout.IsEdited(j.ce.Base); edited {
 				variant, still = takeout.VariantEdited, orig
 			}
-			hit = &takeout.Match{Sidecar: sc, Variant: variant, Still: still, Key: key}
+			hit = &takeout.Match{Sidecar: sc, Variant: variant, Still: still, Key: key, Heuristic: true, Settled: pr.settled(j.fc.name, key, p)}
 		}
 		if n == 1 {
 			return hit
 		}
 	}
 	return nil
+}
+
+// settled reports whether a stored sidecar was already consumed: flagged so,
+// or recorded as an album membership of the photo it names (the flag is
+// cleared when a part is replaced; the membership's occurrence is evidence
+// that survives).
+func (pr *partRun) settled(folder, key string, p store.PendingSidecar) bool {
+	if p.Resolved {
+		return true
+	}
+	o, err := pr.ing.st.FindOccurrence(pr.ctx, pr.acct.ID, pr.part.ExportID, folder, sidecarOnlyPrefix+key)
+	return err == nil && o != nil && o.State != store.OccReset && o.State != store.OccRemoved
 }
 
 // resolveJob resolves the sidecar and remembers whether it came from the
@@ -942,6 +1109,42 @@ func (pr *partRun) commit(x extracted) (err error) {
 		key, src = pr.fallbackKey(fc, base), store.IdentityFallback
 	}
 
+	if x.match != nil && googleID != "" && (x.match.Heuristic || x.match.Settled) {
+		mates, err := pr.stemCandidates(fc, x.match.Key)
+		if err != nil {
+			return err
+		}
+		if err := pr.adoptPairStill(fc.name, x.match, base, mates); err != nil {
+			return err
+		}
+		// a sidecar that relates to this file by a name heuristic (a title, a
+		// truncated name) or a stored one already consumed as an album membership
+		// of the photo it names, while that photo (any variant of it) is already
+		// known with other bytes: whether this file is a new version of the photo
+		// or an unrelated file sharing the name cannot be told until the rest of
+		// the export is seen (ResolvePending decides: the photo delivered
+		// elsewhere in the export makes this an album entry, a complete export
+		// without it makes this the new version). Until then the file stays
+		// nameless and the sidecar is kept
+		if known, collides, err := pr.nameCollision(fc.name, x.match, base, x.sha, mates); err != nil {
+			return err
+		} else if collides {
+			pr.ing.log.Info("sidecar names a known photo with other bytes, decided once the export is complete", "entry", x.e.Name, "google_id", googleID, "known", known.LibPath)
+			if err := st.PutPendingSidecar(ctx, pr.acct.ID, pr.part.ExportID, pr.sidecarPart(sc), fc.name, x.match.Key, sc.Raw, googleID); err != nil {
+				return err
+			}
+			if err := st.DeferPendingSidecar(ctx, pr.acct.ID, pr.part.ExportID, fc.name, x.match.Key, base, x.match.Variant, x.match.Still); err != nil {
+				return err
+			}
+			if pr.pendingRejected == nil {
+				pr.pendingRejected = map[string]bool{}
+			}
+			pr.pendingRejected[fc.name+"/"+x.match.Key] = true
+			x.match, sc, googleID, variant = nil, nil, "", takeout.VariantOriginal
+			name = deriveName(base, nil, variant)
+			key, src = pr.fallbackKey(fc, base), store.IdentityFallback
+		}
+	}
 	item, err := st.FindItemByKey(ctx, pr.acct.ID, key)
 	if err != nil {
 		return err
@@ -1014,6 +1217,24 @@ func (pr *partRun) commit(x extracted) (err error) {
 		}
 	}
 	return pr.ensureGroupLinks(item)
+}
+
+// linkItemsInto links items whose occurrences were re-attached to an album.
+func (pr *partRun) linkItemsInto(to *store.Album, items []int64) error {
+	for _, id := range items {
+		item, err := pr.ing.st.GetItem(pr.ctx, id)
+		if err != nil || item == nil {
+			continue
+		}
+		if _, err := pr.ensureDirectConfirmed(to, item, pr.part.ExportID); err != nil {
+			return fmt.Errorf("re-attaching %s to album %s: %w", item.LibPath, to.Path, err)
+		}
+		if err := pr.ensureGroupLinks(item); err != nil {
+			return err
+		}
+	}
+	pr.ing.log.Info("folder re-attached to the album its metadata names", "album", to.Path, "items", len(items))
+	return nil
 }
 
 // retireOccurrences deactivates the active occurrences of an (album, item)
@@ -1465,7 +1686,7 @@ func (pr *partRun) applyLateSidecars(fc *folderCtx, doneMedia, prevFailed map[st
 		// seen only in that album would otherwise never get its sidecar. Those
 		// waiting for their part's replacement are left to that re-ingest, and
 		// entries a replacement dropped are not in the export any more
-		if o.ItemID == 0 || o.State == store.OccReset || o.State == store.OccRemoved {
+		if o.ItemID == 0 || o.State == store.OccReset || o.State == store.OccRemoved || isSidecarOnlyEntry(o.EntryName) {
 			continue
 		}
 		if o.PartNo == pr.part.PartNo && !doneMedia[fc.name+"/"+o.EntryName] {
@@ -1500,6 +1721,28 @@ func (pr *partRun) applyLateSidecars(fc *folderCtx, doneMedia, prevFailed map[st
 		if !ok {
 			continue
 		}
+		if m.Heuristic {
+			mates, err := pr.stemCandidates(fc, m.Key)
+			if err != nil {
+				return err
+			}
+			if err := pr.adoptPairStill(fc.name, &m, o.EntryName, mates); err != nil {
+				return err
+			}
+			if _, collides, err := pr.nameCollision(fc.name, &m, o.EntryName, pr.itemSHA(item), mates); err != nil {
+				return err
+			} else if collides {
+				// decided by ResolvePending once the export is seen (the index marked
+				// the sidecar used, so it is stored here)
+				if err := st.PutPendingSidecar(ctx, pr.acct.ID, pr.part.ExportID, pr.sidecarPart(m.Sidecar), fc.name, m.Key, m.Sidecar.Raw, m.Sidecar.GoogleID()); err != nil {
+					return err
+				}
+				if err := st.DeferPendingSidecar(ctx, pr.acct.ID, pr.part.ExportID, fc.name, m.Key, o.EntryName, m.Variant, m.Still); err != nil {
+					return err
+				}
+				continue
+			}
+		}
 		entry := "promotion:" + fc.name + "/" + o.EntryName
 		acted, err := pr.applyLateSidecar(item, o, m)
 		if err != nil {
@@ -1509,8 +1752,319 @@ func (pr *partRun) applyLateSidecars(fc *folderCtx, doneMedia, prevFailed map[st
 		if acted || prevFailed[entry] {
 			_ = st.MarkEntry(ctx, pr.arch.ID, entry, store.EntryDone, 0, "")
 		}
+		if m.Heuristic && takeout.IsTitleKey(m.Key) {
+			// a title-named sidecar applied to media of an earlier part is kept,
+			// as consumed, for the companion a later part may bring: a still
+			// after its lone video (which then becomes the motion companion), a
+			// video after its still
+			if err := st.PutPendingSidecar(ctx, pr.acct.ID, pr.part.ExportID, pr.sidecarPart(m.Sidecar), fc.name, m.Key, m.Sidecar.Raw, m.Sidecar.GoogleID()); err != nil {
+				return err
+			}
+			if err := st.MarkPendingResolved(ctx, pr.acct.ID, pr.part.ExportID, fc.name, m.Key); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+// ResolvePending goes over an export's stored sidecars that found no media in
+// their folder. Takeout writes the JSON of a photo into every album folder
+// but the photo itself into one folder only, so such a sidecar in an album
+// folder whose Google id names a known photo is an album membership (recorded
+// as an occurrence without bytes, like any other); and a sidecar whose media
+// is in the folder under a name the index could not relate at the time (a
+// title without extension), or that a part related by a heuristic and
+// deferred, is applied to that item. A nameless file sharing
+// the name of a photo already known with other bytes is an album entry of
+// that photo once the photo turns up elsewhere in the export, and the photo's
+// new version only once the export is complete (complete) without it. It
+// returns the number of album links and promotions made.
+func (ing *Ingester) ResolvePending(ctx context.Context, acct *store.Account, exportID string, complete bool) (links, promoted int, err error) {
+	rows, err := ing.st.PendingSidecarsOfExport(ctx, acct.ID, exportID)
+	if err != nil || len(rows) == 0 {
+		return 0, 0, err
+	}
+	byFolder := map[string][]store.PendingRow{}
+	for _, r := range rows {
+		byFolder[r.Folder] = append(byFolder[r.Folder], r)
+	}
+	for folder, prs := range byFolder {
+		occs, err := ing.st.OccurrencesInFolder(ctx, acct.ID, exportID, folder)
+		if err != nil {
+			return links, promoted, err
+		}
+		byEntry := map[string]*store.Occurrence{}
+		for _, o := range occs {
+			if o.ItemID != 0 && o.State != store.OccReset && o.State != store.OccRemoved && !isSidecarOnlyEntry(o.EntryName) {
+				byEntry[strings.ToLower(o.EntryName)] = o
+			}
+		}
+		// the album this export attached the folder to (recorded when the folder
+		// was seen; a folder name recurs across exports for different albums);
+		// for exports ingested before that record existed, the only album with
+		// that folder, else none
+		var album *store.Album
+		albumID, err := ing.st.ExportFolderAlbum(ctx, acct.ID, exportID, folder)
+		if err != nil {
+			return links, promoted, err
+		}
+		if albumID != 0 {
+			if album, err = ing.st.GetAlbum(ctx, albumID); err != nil {
+				return links, promoted, err
+			}
+		} else if albums, err := ing.st.AlbumsByFolder(ctx, acct.ID, folder); err != nil {
+			return links, promoted, err
+		} else if len(albums) == 1 {
+			// a guess by folder name, recorded as provisional: metadata of this
+			// export arriving later names another album and moves the folder
+			album = albums[0]
+			if err := ing.st.SetExportFolderAlbum(ctx, acct.ID, exportID, folder, album.ID); err != nil {
+				return links, promoted, err
+			}
+		}
+		for _, r := range prs {
+			sc, err := takeout.ParseSidecar(r.Raw)
+			if err != nil {
+				continue
+			}
+			sc.SourcePart = r.PartNo
+			pr := &partRun{ing: ing, ctx: ctx, acct: acct, part: PartMeta{Account: acct.Name, ExportID: exportID, PartNo: r.PartNo, Name: "pending:" + r.Key}, folders: map[string]*folderCtx{}}
+			// the media the sidecar relates to: the entry a heuristic match of a
+			// part was deferred for (recorded with its variant), and media under a
+			// name the index could not relate at the time, a title without
+			// extension matching the entries' stem for a lone file or a still
+			// with its video (StemRole); anything else stays pending
+			type candidate struct{ name, variant, still string }
+			var cands []candidate
+			var stemNames []string
+			if takeout.IsTitleKey(r.Key) {
+				for _, o := range byEntry {
+					if takeout.IsStemKey(o.EntryName, r.Key) {
+						stemNames = append(stemNames, o.EntryName)
+					}
+				}
+			}
+			if r.Entry != "" && byEntry[strings.ToLower(r.Entry)] != nil {
+				c := candidate{r.Entry, r.Variant, r.Still}
+				if takeout.IsStemKey(r.Entry, r.Key) {
+					// a deferred stem match is judged again against the media sharing
+					// the stem now: a second still arrived since makes it ambiguous, a
+					// still arrived since makes a deferred video the motion companion
+					variant, still, ok := takeout.StemRole(r.Entry, stemNames)
+					if !ok {
+						c.name = ""
+					} else {
+						c.variant, c.still = variant, still
+					}
+				}
+				if c.name != "" {
+					cands = append(cands, c)
+				}
+			}
+			if len(stemNames) > 0 {
+				var stemCands []candidate
+				for _, name := range stemNames {
+					variant, still, ok := takeout.StemRole(name, stemNames)
+					if !ok {
+						stemCands = nil
+						break
+					}
+					if !strings.EqualFold(name, r.Entry) {
+						stemCands = append(stemCands, candidate{name, variant, still})
+					}
+				}
+				cands = append(cands, stemCands...)
+			}
+			if len(cands) > 0 {
+				// the media may be the photo itself (then its own sidecar covers
+				// it), take the sidecar, or be unrelated files that merely share
+				// the name: then the sidecar is an album entry of the photo its
+				// Google id names, like one without media at all
+				consumed, undecided := false, false
+				for _, c := range cands {
+					name, variant, still := c.name, c.variant, c.still
+					occ := byEntry[strings.ToLower(name)]
+					item, err := ing.st.GetItem(ctx, occ.ItemID)
+					if err != nil || item == nil {
+						continue
+					}
+					if cur, err := ing.st.GetSidecar(ctx, item.ID); err != nil {
+						return links, promoted, err
+					} else if cur != nil {
+						if item.GoogleID != "" && item.GoogleID == sc.GoogleID() {
+							consumed = true // the photo itself, already described
+							_ = ing.st.MarkPendingResolved(ctx, acct.ID, exportID, folder, r.Key)
+						}
+						continue
+					}
+					// a nameless file sharing the name of a photo known with other
+					// bytes: an album entry of that photo if the export delivered the
+					// photo elsewhere, its new version if the export is complete
+					// without it, undecided otherwise
+					m := takeout.Match{Sidecar: sc, Variant: variant, Still: still, Key: r.Key}
+					if err := pr.adoptPairStill(folder, &m, occ.EntryName, stemNames); err != nil {
+						return links, promoted, err
+					}
+					if known, collides, err := pr.nameCollision(folder, &m, occ.EntryName, pr.itemSHA(item), stemNames); err != nil {
+						return links, promoted, err
+					} else if collides {
+						elsewhere, err := ing.st.PhotoDeliveredElsewhereInExport(ctx, acct.ID, known.GoogleID, exportID, folder, occ.EntryName)
+						if err != nil {
+							return links, promoted, err
+						}
+						if elsewhere {
+							continue // the membership path below
+						}
+						if !complete {
+							undecided = true
+							continue
+						}
+					}
+					acted, err := pr.applyLateSidecar(item, occ, m)
+					if err != nil {
+						ing.log.Warn("pending sidecar not applied", "folder", folder, "key", r.Key, "err", err)
+						continue
+					}
+					if acted {
+						consumed = true
+						promoted++
+						_ = ing.st.MarkPendingResolved(ctx, acct.ID, exportID, folder, r.Key)
+					}
+				}
+				if consumed || undecided {
+					continue
+				}
+			}
+			// an album membership of a photo known by its Google id
+			gid := sc.GoogleID()
+			if album == nil || gid == "" {
+				continue
+			}
+			variant := takeout.VariantOriginal
+			if _, edited := takeout.IsEdited(r.Key); edited {
+				variant = takeout.VariantEdited
+			}
+			item, err := ing.st.FindItemByKey(ctx, acct.ID, gid+"#"+variant)
+			if err != nil {
+				return links, promoted, err
+			}
+			if item == nil {
+				continue // the photo may still arrive in a later part
+			}
+			if r.PartNo == 0 {
+				// a stored sidecar of unknown source part (predating part tracking):
+				// a membership made from it could never be withdrawn with its part
+				continue
+			}
+			// the link first, the occurrence last: until the occurrence exists the
+			// row stays pending and a failure here is retried by the next run (a
+			// link without occurrence is unsupported and reconciled away)
+			linked, err := pr.ensureDirectConfirmed(album, item, exportID)
+			if err != nil {
+				return links, promoted, fmt.Errorf("album link for %s/%s: %w", folder, r.Key, err)
+			}
+			if err := pr.ensureGroupLinks(item); err != nil {
+				return links, promoted, err
+			}
+			// its own occurrence, apart from any media file of that name that may
+			// turn up in the folder later (another photo would replace it otherwise)
+			if _, err := ing.st.UpsertOccurrence(ctx, &store.Occurrence{AccountID: acct.ID, ExportID: exportID, PartNo: r.PartNo, Folder: folder, EntryName: sidecarOnlyPrefix + r.Key,
+				Variant: variant, AlbumID: album.ID, ItemID: item.ID, State: store.OccResolved}); err != nil {
+				return links, promoted, err
+			}
+			if err := pr.retireOccurrences(album, item); err != nil {
+				return links, promoted, err
+			}
+			_ = ing.st.MarkPendingResolved(ctx, acct.ID, exportID, folder, r.Key)
+			if linked {
+				links++
+			}
+		}
+	}
+	return links, promoted, nil
+}
+
+// nameCollision reports whether a file (base, with bytes sha) that a sidecar
+// relates to by name alone collides with the photo the sidecar names because
+// that photo is already known with other bytes: the file may then be the
+// photo's new version or an unrelated file sharing the name. The variant the
+// match assigns is compared first; when only another variant is known, the
+// file is the photo's companion, not a collision, if that variant was
+// delivered by the same folder of this export under one of the mates (names
+// sharing the stem: a still with its video, an original with its edited copy).
+func (pr *partRun) nameCollision(folder string, m *takeout.Match, base, sha string, mates []string) (known *store.Item, collides bool, err error) {
+	gid := m.Sidecar.GoogleID()
+	if gid == "" {
+		return nil, false, nil
+	}
+	if known, err = pr.ing.st.FindItemByKey(pr.ctx, pr.acct.ID, gid+"#"+m.Variant); err != nil {
+		return nil, false, err
+	} else if known != nil {
+		return known, pr.itemSHA(known) != sha, nil
+	}
+	if known, err = pr.ing.st.ItemsByGoogleIDAny(pr.ctx, pr.acct.ID, gid); err != nil || known == nil {
+		return nil, false, err
+	}
+	mate, err := pr.deliveredAsMate(folder, known, base, append([]string{m.Still}, mates...))
+	return known, !mate, err
+}
+
+// deliveredAsMate reports whether an item was delivered by this folder of
+// the export under one of the names (other than base).
+func (pr *partRun) deliveredAsMate(folder string, item *store.Item, base string, names []string) (bool, error) {
+	for _, n := range names {
+		if n == "" || strings.EqualFold(n, base) {
+			continue
+		}
+		o, err := pr.ing.st.FindOccurrence(pr.ctx, pr.acct.ID, pr.part.ExportID, folder, n)
+		if err != nil {
+			return false, err
+		}
+		if o != nil && o.ItemID == item.ID && o.State != store.OccReset && o.State != store.OccRemoved {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// adoptPairStill handles a still related to a title-named sidecar by its
+// stem whose photo's original is a lone video of the same folder (the video
+// arrived in an earlier part, before its still, and was the original for want
+// of one): the video becomes the photo's motion companion so that the still
+// can be its original.
+func (pr *partRun) adoptPairStill(folder string, m *takeout.Match, base string, mates []string) error {
+	gid := m.Sidecar.GoogleID()
+	if gid == "" || m.Variant != takeout.VariantOriginal || !takeout.IsTitleKey(m.Key) || !takeout.IsStillName(base) {
+		return nil
+	}
+	st := pr.ing.st
+	orig, err := st.FindItemByKey(pr.ctx, pr.acct.ID, gid+"#"+takeout.VariantOriginal)
+	if err != nil || orig == nil || !takeout.IsVideoName(orig.Filename) {
+		return err
+	}
+	if mate, err := pr.deliveredAsMate(folder, orig, base, mates); err != nil || !mate {
+		return err
+	}
+	motionKey := gid + "#" + takeout.VariantMotion
+	if other, err := st.FindItemByKey(pr.ctx, pr.acct.ID, motionKey); err != nil || other != nil {
+		return err // a motion companion exists already; the still is handled as an alt variant
+	}
+	pr.ing.log.Info("video that preceded its still becomes the motion companion", "video", orig.LibPath, "still", base)
+	orig.Variant, orig.IdentityKey, orig.GroupID = takeout.VariantMotion, motionKey, gid+"#"+takeout.VariantOriginal
+	if err := st.UpdateItem(pr.ctx, orig); err != nil {
+		return err
+	}
+	return st.SetOccurrencesVariant(pr.ctx, orig.ID, takeout.VariantMotion)
+}
+
+// itemSHA returns the hash of an item's current bytes ("" when unknown).
+func (pr *partRun) itemSHA(item *store.Item) string {
+	b, err := pr.ing.st.GetBlob(pr.ctx, item.BlobID)
+	if err != nil || b == nil {
+		return ""
+	}
+	return b.SHA256
 }
 
 // applyLateSidecar gives a fallback item the identity its sidecar carries,
