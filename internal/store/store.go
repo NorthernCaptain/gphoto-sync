@@ -426,6 +426,11 @@ func (s *Store) ResetPartForReingest(ctx context.Context, archiveID, accountID i
 		if _, err := q.ExecContext(ctx, `DELETE FROM pending_sidecars WHERE account_id = ? AND export_id = ? AND (part_no = ? OR part_no IS NULL)`, accountID, exportID, partNo); err != nil {
 			return err
 		}
+		// stored sidecars this part supplied must be seen again in the replacement
+		// (ReleaseUnconfirmedSidecars handles the rest once it is ingested)
+		if _, err := q.ExecContext(ctx, `UPDATE sidecars SET reconfirm = 1 WHERE export_id = ? AND part_no = ? AND item_id IN (SELECT id FROM items WHERE account_id = ?)`, exportID, partNo, accountID); err != nil {
+			return err
+		}
 		if _, err := q.ExecContext(ctx, `UPDATE album_items SET confirmed_export_id = (
 				SELECT o.export_id FROM occurrences o WHERE o.album_id = album_items.album_id AND o.item_id = album_items.item_id AND o.active = 1
 				ORDER BY `+exportOrderDesc+` LIMIT 1)
@@ -830,6 +835,9 @@ type SidecarRow struct {
 	SHA256   string
 	ExportID string // export that supplied this sidecar
 	PartNo   int    // part of that export that supplied it (0 when unknown)
+	// Reconfirm is set while the supplying part is being ingested again and
+	// has not yet shown the sidecar.
+	Reconfirm bool
 }
 
 // GetSidecar returns an item's stored sidecar or nil.
@@ -837,7 +845,7 @@ func (s *Store) GetSidecar(ctx context.Context, itemID int64) (*SidecarRow, erro
 	var r SidecarRow
 	var exp sql.NullString
 	var part sql.NullInt64
-	err := s.q.QueryRowContext(ctx, `SELECT item_id, json, sha256, export_id, part_no FROM sidecars WHERE item_id = ?`, itemID).Scan(&r.ItemID, &r.JSON, &r.SHA256, &exp, &part)
+	err := s.q.QueryRowContext(ctx, `SELECT item_id, json, sha256, export_id, part_no, reconfirm FROM sidecars WHERE item_id = ?`, itemID).Scan(&r.ItemID, &r.JSON, &r.SHA256, &exp, &part, &r.Reconfirm)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -845,10 +853,31 @@ func (s *Store) GetSidecar(ctx context.Context, itemID int64) (*SidecarRow, erro
 	return &r, err
 }
 
-// SetSidecarExport records that a newer export (part) carries the same sidecar.
+// SetSidecarExport records that an export (part) carries the same sidecar
+// and becomes its source; the sidecar counts as confirmed by it.
 func (s *Store) SetSidecarExport(ctx context.Context, itemID int64, exportID string, partNo int) error {
-	_, err := s.q.ExecContext(ctx, `UPDATE sidecars SET export_id = ?, part_no = ? WHERE item_id = ?`, nullStr(exportID), nullInt(int64(partNo)), itemID)
+	_, err := s.q.ExecContext(ctx, `UPDATE sidecars SET export_id = ?, part_no = ?, reconfirm = 0 WHERE item_id = ?`, nullStr(exportID), nullInt(int64(partNo)), itemID)
 	return err
+}
+
+// MarkSidecarReconfirm flags an item's sidecar as awaiting its source part's
+// replacement (carried over when the sidecar moves to another item).
+func (s *Store) MarkSidecarReconfirm(ctx context.Context, itemID int64) error {
+	_, err := s.q.ExecContext(ctx, `UPDATE sidecars SET reconfirm = 1 WHERE item_id = ?`, itemID)
+	return err
+}
+
+// ReleaseUnconfirmedSidecars ends a replaced part's re-ingest for the stored
+// sidecars it supplied before but no longer carries: their metadata stays
+// (it is still Google's own description of the photo) but their provenance
+// is cleared, so any later exact sidecar replaces them. It returns how many.
+func (s *Store) ReleaseUnconfirmedSidecars(ctx context.Context, accountID int64, exportID string, partNo int) (int64, error) {
+	res, err := s.q.ExecContext(ctx, `UPDATE sidecars SET export_id = NULL, part_no = NULL, reconfirm = 0
+		WHERE reconfirm = 1 AND export_id = ? AND part_no = ? AND item_id IN (SELECT id FROM items WHERE account_id = ?)`, exportID, partNo, accountID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // UpsertSidecar stores an item's sidecar and the extracted fields.
@@ -857,9 +886,9 @@ func (s *Store) UpsertSidecar(ctx context.Context, itemID int64, raw []byte, sha
 	if lat != nil {
 		la, lo, al = *lat, *lon, *alt
 	}
-	_, err := s.q.ExecContext(ctx, `INSERT INTO sidecars(item_id, json, sha256, description, favorited, lat, lon, alt, people, export_id, part_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err := s.q.ExecContext(ctx, `INSERT INTO sidecars(item_id, json, sha256, description, favorited, lat, lon, alt, people, export_id, part_no, reconfirm) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
 		ON CONFLICT(item_id) DO UPDATE SET json = excluded.json, sha256 = excluded.sha256, description = excluded.description, favorited = excluded.favorited,
-		  lat = excluded.lat, lon = excluded.lon, alt = excluded.alt, people = excluded.people, export_id = excluded.export_id, part_no = excluded.part_no`,
+		  lat = excluded.lat, lon = excluded.lon, alt = excluded.alt, people = excluded.people, export_id = excluded.export_id, part_no = excluded.part_no, reconfirm = 0`,
 		itemID, raw, sha, nullStr(description), favorited, la, lo, al, nullStr(people), nullStr(exportID), nullInt(int64(partNo)))
 	return err
 }
@@ -1028,9 +1057,11 @@ func (s *Store) UnsupportedDirectMemberships(ctx context.Context, accountID, com
 }
 
 // ClearResetState ends the wait for a part's replacement: occurrences it
-// dropped stay inactive but no longer hold reconciliation back.
+// dropped stay inactive as 'removed' (the entry is gone from the export: no
+// late sidecar may address them, and a sidecar for that name waits for media
+// elsewhere) and no longer hold reconciliation back.
 func (s *Store) ClearResetState(ctx context.Context, accountID int64, exportID string, partNo int) error {
-	_, err := s.q.ExecContext(ctx, `UPDATE occurrences SET state = ? WHERE account_id = ? AND export_id = ? AND part_no = ? AND state = ?`, OccIngested, accountID, exportID, partNo, OccReset)
+	_, err := s.q.ExecContext(ctx, `UPDATE occurrences SET state = ? WHERE account_id = ? AND export_id = ? AND part_no = ? AND state = ?`, OccRemoved, accountID, exportID, partNo, OccReset)
 	return err
 }
 
@@ -1085,7 +1116,8 @@ const (
 	OccWaiting  = "waiting"
 	OccIngested = "ingested"
 	OccResolved = "resolved"
-	OccReset    = "reset" // deactivated by a replacement of its part that is still being ingested
+	OccReset    = "reset"   // deactivated by a replacement of its part that is still being ingested
+	OccRemoved  = "removed" // its part was ingested again without this entry: the media is not in the export any more
 )
 
 const occCols = `id, account_id, export_id, part_no, folder, entry_name, variant, sha256, album_id, item_id, state, active`
@@ -1133,7 +1165,8 @@ func (s *Store) SetOccurrenceItem(ctx context.Context, id, itemID int64, state s
 
 // MoveOccurrences re-points all occurrences of one item to another.
 func (s *Store) MoveOccurrences(ctx context.Context, fromItem, toItem int64) error {
-	_, err := s.q.ExecContext(ctx, `UPDATE occurrences SET item_id = ?, state = 'resolved' WHERE item_id = ?`, toItem, fromItem)
+	// occurrences waiting for their part's replacement, or dropped by one, keep that state
+	_, err := s.q.ExecContext(ctx, `UPDATE occurrences SET item_id = ?, state = CASE WHEN state IN (?, ?) THEN state ELSE 'resolved' END WHERE item_id = ?`, toItem, OccReset, OccRemoved, fromItem)
 	return err
 }
 
@@ -1202,7 +1235,8 @@ func (s *Store) CountPendingSidecars(ctx context.Context, accountID int64) (int,
 	var n int
 	err := s.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_sidecars p WHERE p.account_id = ?
 		AND NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.account_id = p.account_id AND o.export_id = p.export_id
-		                AND o.folder = p.folder AND o.entry_name = p.media_key COLLATE NOCASE AND o.item_id IS NOT NULL)`, accountID).Scan(&n)
+		                AND o.folder = p.folder AND o.entry_name = p.media_key COLLATE NOCASE AND o.item_id IS NOT NULL
+		                AND o.state NOT IN (?, ?))`, accountID, OccReset, OccRemoved).Scan(&n)
 	return n, err
 }
 

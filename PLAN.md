@@ -526,8 +526,9 @@ items        (id, account_id, blob_id, google_id, variant {original,edited,motio
                                                   -- lib_path, albums.path, link_path, canonical_path: all relative
                                                   -- to data_dir and prefixed with the account folder
 sidecars     (item_id, json BLOB, description, favorited, lat, lon, alt, people JSON,
-              export_id NULL, part_no NULL)       -- export and part that supplied this sidecar
-                                                  -- (a replaced part may correct it by exact match)
+              export_id NULL, part_no NULL,       -- export and part that supplied this sidecar
+              reconfirm)                          -- (a replaced part may correct it by exact match; one it
+                                                  --  no longer carries keeps its metadata, loses provenance)
 albums       (id, account_id, title, album_date, takeout_folder, kind {own,shared,partner},
               path UNIQUE, created, updated)      -- identity (account, title, album_date) or (account, takeout_folder)
 occurrences  (id, account_id, export_id, part_no, folder, entry_name, variant, sha256,

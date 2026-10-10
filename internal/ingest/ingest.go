@@ -93,27 +93,28 @@ type Options struct {
 
 // Result summarises one part.
 type Result struct {
-	Part            string
-	Status          string
-	Entries         int
-	Media           int
-	Added           int
-	Duplicates      int
-	Changed         int
-	Versioned       int  // differing bytes from an older export, kept as versions
-	Replaced        bool // an earlier ingest of this part was forgotten before this one
-	Unlinked        int  // album links removed because no ingested part lists them any more
-	Promoted        int
-	Merged          int
-	Links           int
-	Failed          int
-	GivenUp         int
-	Skipped         int
-	Unresolved      int
-	PendingSidecars int
-	Albums          int
-	Duration        time.Duration
-	Errors          []string
+	Part             string
+	Status           string
+	Entries          int
+	Media            int
+	Added            int
+	Duplicates       int
+	Changed          int
+	Versioned        int  // differing bytes from an older export, kept as versions
+	Replaced         bool // an earlier ingest of this part was forgotten before this one
+	Unlinked         int  // album links removed because no ingested part lists them any more
+	SidecarsOrphaned int  // stored sidecars this part supplied before but no longer carries
+	Promoted         int
+	Merged           int
+	Links            int
+	Failed           int
+	GivenUp          int
+	Skipped          int
+	Unresolved       int
+	PendingSidecars  int
+	Albums           int
+	Duration         time.Duration
+	Errors           []string
 }
 
 // Ingester holds the dependencies of ingest runs.
@@ -481,8 +482,11 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 	// sidecars that found no media in this part wait for later parts
 	for _, fc := range pr.folders {
 		for _, u := range fc.index.Unused() {
-			// media already ingested from another part of this export: nothing to wait for
-			if occ, err := ing.st.FindOccurrence(ctx, acct.ID, part.ExportID, fc.name, u.Key); err == nil && occ != nil && occ.ItemID != 0 {
+			// media already ingested from another part of this export: nothing to
+			// wait for. An occurrence still waiting for its part's replacement is
+			// as good as absent: the replacement may have moved the media to a
+			// later part, which must find this sidecar
+			if occ, err := ing.st.FindOccurrence(ctx, acct.ID, part.ExportID, fc.name, u.Key); err == nil && occ != nil && occ.ItemID != 0 && occ.State != store.OccReset && occ.State != store.OccRemoved {
 				continue
 			}
 			if err := ing.st.PutPendingSidecar(ctx, acct.ID, part.ExportID, part.PartNo, fc.name, u.Key, u.SC.Raw); err != nil {
@@ -520,6 +524,14 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 		pr.res.Unlinked = n
 		if err := ing.st.ClearResetState(ctx, acct.ID, part.ExportID, part.PartNo); err != nil {
 			return nil, err
+		}
+		orphaned, err := ing.st.ReleaseUnconfirmedSidecars(ctx, acct.ID, part.ExportID, part.PartNo)
+		if err != nil {
+			return nil, err
+		}
+		if orphaned > 0 {
+			ing.log.Warn("sidecars this part supplied before are not in its replacement; their metadata stays but with unknown provenance", "part", part.Name, "count", orphaned)
+			pr.res.SidecarsOrphaned = int(orphaned)
 		}
 	}
 	if err := ing.st.FinishArchive(ctx, arch.ID, status, pr.res.Media, counts[store.EntryDone], pr.res.Duplicates, pr.res.Failed+pr.res.GivenUp); err != nil {
@@ -869,7 +881,21 @@ func (pr *partRun) writeSidecarFile(libPath string, sc *takeout.Sidecar) error {
 	return nil
 }
 
+// sidecarPart is the part a sidecar in hand came from: the pending store's
+// part when it was taken from there, else this part.
+func (pr *partRun) sidecarPart(sc *takeout.Sidecar) int {
+	if sc != nil && sc.SourcePart != 0 {
+		return sc.SourcePart
+	}
+	return pr.part.PartNo
+}
+
 func (pr *partRun) saveSidecar(tx *store.Store, itemID int64, sc *takeout.Sidecar) error {
+	return pr.saveSidecarAs(tx, itemID, sc, pr.part.ExportID, pr.sidecarPart(sc))
+}
+
+// saveSidecarAs stores a sidecar with an explicit provenance.
+func (pr *partRun) saveSidecarAs(tx *store.Store, itemID int64, sc *takeout.Sidecar, exportID string, partNo int) error {
 	if sc == nil {
 		return nil
 	}
@@ -882,11 +908,7 @@ func (pr *partRun) saveSidecar(tx *store.Store, itemID int64, sc *takeout.Sideca
 		b, _ := json.Marshal(names)
 		people = string(b)
 	}
-	partNo := pr.part.PartNo
-	if sc.SourcePart != 0 {
-		partNo = sc.SourcePart // taken from the pending store: that part supplied it
-	}
-	return tx.UpsertSidecar(pr.ctx, itemID, sc.Raw, sc.SHA256, sc.Description, sc.Favorited, lat, lon, alt, people, pr.part.ExportID, partNo)
+	return tx.UpsertSidecar(pr.ctx, itemID, sc.Raw, sc.SHA256, sc.Description, sc.Favorited, lat, lon, alt, people, exportID, partNo)
 }
 
 // ---- commit ----------------------------------------------------------------
@@ -1159,6 +1181,12 @@ func (pr *partRun) olderThan(exportID string) bool {
 // applySidecar stores a sidecar for an item unless the stored one came from a
 // newer export. It reports whether the stored sidecar changed.
 func (pr *partRun) applySidecar(item *store.Item, sc *takeout.Sidecar, name string) (bool, error) {
+	return pr.applySidecarAs(item, sc, name, pr.part.ExportID, pr.sidecarPart(sc))
+}
+
+// applySidecarAs is applySidecar for a sidecar of explicit provenance (an
+// empty exportID means unknown: such a sidecar only ever fills a void).
+func (pr *partRun) applySidecarAs(item *store.Item, sc *takeout.Sidecar, name, exportID string, partNo int) (bool, error) {
 	ctx, st := pr.ctx, pr.ing.st
 	cur, err := st.GetSidecar(ctx, item.ID)
 	if err != nil {
@@ -1166,21 +1194,28 @@ func (pr *partRun) applySidecar(item *store.Item, sc *takeout.Sidecar, name stri
 	}
 	switch {
 	case cur != nil && cur.SHA256 == sc.SHA256:
-		if cur.ExportID == "" || ExportOlder(cur.ExportID, pr.part.ExportID) {
-			partNo := pr.part.PartNo
-			if sc.SourcePart != 0 {
-				partNo = sc.SourcePart
-			}
-			if err := st.SetSidecarExport(ctx, item.ID, pr.part.ExportID, partNo); err != nil {
+		switch {
+		case exportID == "":
+			// unknown provenance vouches for nothing
+		case cur.ExportID == "" || ExportOlder(cur.ExportID, exportID):
+			// unknown or older provenance: this export now vouches for it
+			if err := st.SetSidecarExport(ctx, item.ID, exportID, partNo); err != nil {
 				return false, err
 			}
+		case cur.ExportID == exportID:
+			// the same export carries it: the part in hand is its source (it
+			// confirms a part being ingested again, or takes over from one)
+			if err := st.SetSidecarExport(ctx, item.ID, exportID, partNo); err != nil {
+				return false, err
+			}
+			// an older export carrying the same sidecar vouches for nothing
 		}
-	case cur != nil && pr.olderThan(cur.ExportID):
-		// an older export's view of the metadata; the newer one stays
-		pr.ing.log.Debug("ignoring sidecar from an older export", "item", item.LibPath, "export", pr.part.ExportID, "kept", cur.ExportID)
+	case cur != nil && (exportID == "" || (cur.ExportID != "" && ExportOlder(exportID, cur.ExportID))):
+		// an older (or unknown) view of the metadata; the stored one stays
+		pr.ing.log.Debug("ignoring sidecar not newer than the stored one", "item", item.LibPath, "export", exportID, "kept", cur.ExportID)
 		sc = &takeout.Sidecar{Raw: cur.JSON}
 	default:
-		if err := pr.updateSidecar(item, sc, name); err != nil {
+		if err := pr.updateSidecarAs(item, sc, name, exportID, partNo); err != nil {
 			return false, fmt.Errorf("sidecar update: %w", err)
 		}
 		return true, nil
@@ -1353,6 +1388,11 @@ func (pr *partRun) supersede(item *store.Item, oldBlob *store.Blob, x extracted)
 // updateSidecar stores a changed sidecar and moves the file if its name or
 // capture month changed.
 func (pr *partRun) updateSidecar(item *store.Item, sc *takeout.Sidecar, name string) error {
+	return pr.updateSidecarAs(item, sc, name, pr.part.ExportID, pr.sidecarPart(sc))
+}
+
+// updateSidecarAs is updateSidecar with an explicit provenance.
+func (pr *partRun) updateSidecarAs(item *store.Item, sc *takeout.Sidecar, name, exportID string, partNo int) error {
 	ctx, st := pr.ctx, pr.ing.st
 	taken, takenSrc := item.TakenAt, item.TakenSrc
 	if t, ok := sc.Taken(); ok {
@@ -1397,7 +1437,7 @@ func (pr *partRun) updateSidecar(item *store.Item, sc *takeout.Sidecar, name str
 				return err
 			}
 		}
-		return pr.saveSidecar(tx, item.ID, sc)
+		return pr.saveSidecarAs(tx, item.ID, sc, exportID, partNo)
 	})
 	if err != nil {
 		return err
@@ -1420,7 +1460,12 @@ func (pr *partRun) applyLateSidecars(fc *folderCtx, doneMedia, prevFailed map[st
 		return err
 	}
 	for _, o := range occs {
-		if o.ItemID == 0 || !o.Active {
+		// inactive occurrences count too: a membership withdrawn by a newer
+		// listing says nothing about the item's identity or metadata, and media
+		// seen only in that album would otherwise never get its sidecar. Those
+		// waiting for their part's replacement are left to that re-ingest, and
+		// entries a replacement dropped are not in the export any more
+		if o.ItemID == 0 || o.State == store.OccReset || o.State == store.OccRemoved {
 			continue
 		}
 		if o.PartNo == pr.part.PartNo && !doneMedia[fc.name+"/"+o.EntryName] {
@@ -1440,10 +1485,15 @@ func (pr *partRun) applyLateSidecars(fc *folderCtx, doneMedia, prevFailed map[st
 		case cur == nil:
 			// the lookup also marks the sidecar used, so a re-run never stores it as pending
 			m, ok = fc.index.Lookup(o.EntryName)
-		case cur.ExportID == pr.part.ExportID && cur.PartNo == pr.part.PartNo && o.PartNo != pr.part.PartNo:
-			// this part supplied the stored sidecar of media that lives in another
-			// part; ingested again (a replacement), an exact sidecar may correct it
+		case o.PartNo != pr.part.PartNo && (cur.ExportID == "" || (cur.ExportID == pr.part.ExportID && cur.PartNo == pr.part.PartNo)):
+			// media in another part whose stored sidecar this part supplied (being
+			// ingested again, a replacement) or whose sidecar has no known source
+			// (released by an earlier replacement, or migrated): an exact sidecar
+			// confirms it, or corrects it
 			if m, ok = fc.index.Exact(o.EntryName); ok && m.Sidecar.SHA256 == cur.SHA256 {
+				if err := st.SetSidecarExport(ctx, item.ID, pr.part.ExportID, pr.part.PartNo); err != nil {
+					return err
+				}
 				ok = false
 			}
 		}
@@ -1510,9 +1560,20 @@ func (pr *partRun) promote(fb *store.Item, sc *takeout.Sidecar, variant, googleI
 	} else if target != nil {
 		return pr.mergeInto(fb, target, sc, variant)
 	}
-	name := deriveName(fb.Filename, sc, variant)
+	// the arriving sidecar establishes the identity; its metadata applies only
+	// when the stored sidecar is not from a newer export
+	meta, keepStored := sc, false
+	if cur, err := st.GetSidecar(ctx, fb.ID); err != nil {
+		return nil, err
+	} else if cur != nil && pr.olderThan(cur.ExportID) {
+		if stored, err := takeout.ParseSidecar(cur.JSON); err == nil {
+			meta, keepStored = stored, true
+			pr.ing.log.Debug("promotion keeps the newer stored sidecar", "item", fb.LibPath, "stored", cur.ExportID, "arriving", pr.part.ExportID)
+		}
+	}
+	name := deriveName(fb.Filename, meta, variant)
 	taken, takenSrc := fb.TakenAt, fb.TakenSrc
-	if t, ok := sc.Taken(); ok {
+	if t, ok := meta.Taken(); ok {
 		taken, takenSrc = t, "sidecar"
 	}
 	blob, err := st.GetBlob(ctx, fb.BlobID)
@@ -1554,12 +1615,15 @@ func (pr *partRun) promote(fb *store.Item, sc *takeout.Sidecar, variant, googleI
 		if err := tx.MoveOccurrences(ctx, fb.ID, fb.ID); err != nil {
 			return err
 		}
+		if keepStored {
+			return nil
+		}
 		return pr.saveSidecar(tx, fb.ID, sc)
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := pr.writeSidecarFile(newPath, sc); err != nil {
+	if err := pr.writeSidecarFile(newPath, meta); err != nil {
 		return nil, err
 	}
 	pr.res.Promoted++
@@ -1604,6 +1668,36 @@ func (pr *partRun) mergeInto(fb, target *store.Item, sc *takeout.Sidecar, varian
 		target.BytesExportID = fbExport
 		if err := st.UpdateItem(ctx, target); err != nil {
 			return nil, err
+		}
+	}
+	// the fallback's own stored sidecar (possibly from a newer export than the
+	// arriving one) competes for the target by its provenance, then the
+	// arriving sidecar by this part's; the export-order rule decides both
+	if fbSc, err := st.GetSidecar(ctx, fb.ID); err != nil {
+		return nil, err
+	} else if fbSc != nil {
+		tSc, err := st.GetSidecar(ctx, target.ID)
+		if err != nil {
+			return nil, err
+		}
+		// a fallback sidecar still awaiting its source part's replacement never
+		// displaces a target sidecar that export has confirmed (any of its parts)
+		stale := fbSc.Reconfirm && tSc != nil && !tSc.Reconfirm && tSc.ExportID == fbSc.ExportID
+		if stored, err := takeout.ParseSidecar(fbSc.JSON); err == nil && !stale {
+			if _, err := pr.applySidecarAs(target, stored, deriveName(fb.Filename, stored, variant), fbSc.ExportID, fbSc.PartNo); err != nil {
+				return nil, err
+			}
+			// when the awaiting sidecar is the one now on the target, the wait
+			// follows it, or the replacement could never release it
+			if fbSc.Reconfirm {
+				if tSc, err = st.GetSidecar(ctx, target.ID); err != nil {
+					return nil, err
+				} else if tSc != nil && tSc.SHA256 == fbSc.SHA256 && tSc.ExportID == fbSc.ExportID && tSc.PartNo == fbSc.PartNo {
+					if err := st.MarkSidecarReconfirm(ctx, target.ID); err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 	}
 	if sc != nil {

@@ -309,6 +309,9 @@ func printResult(r *ingest.Result) {
 	if r.Unlinked > 0 {
 		fmt.Printf("  %d album links removed: no ingested part lists them any more\n", r.Unlinked)
 	}
+	if r.SidecarsOrphaned > 0 {
+		fmt.Printf("  %d sidecars this part supplied before are missing from its replacement (metadata kept, provenance cleared)\n", r.SidecarsOrphaned)
+	}
 	fmt.Printf("  entries %d, media %d, albums %d, skipped %d\n", r.Entries, r.Media, r.Albums, r.Skipped)
 	fmt.Printf("  added %d, duplicates %d, changed %d, promoted %d, merged %d, links %d\n", r.Added, r.Duplicates, r.Changed, r.Promoted, r.Merged, r.Links)
 	fmt.Printf("  failed %d, given up %d, unresolved %d, pending sidecars %d, took %s\n", r.Failed, r.GivenUp, r.Unresolved, r.PendingSidecars, r.Duration.Round(time.Second))

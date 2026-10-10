@@ -19,6 +19,7 @@ import (
 	"gphoto-sync/internal/db"
 	"gphoto-sync/internal/fsops"
 	"gphoto-sync/internal/store"
+	"gphoto-sync/internal/takeout"
 )
 
 type fixture struct {
@@ -1040,5 +1041,329 @@ func TestReplacedPartCorrectsCrossPartSidecar(t *testing.T) {
 	}
 	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
+	}
+}
+
+// An older export's sidecar that gives a fallback item its Google id must not
+// replace metadata a newer export already stored for it.
+func TestPromotionKeepsNewerStoredSidecar(t *testing.T) {
+	f := newFixture(t)
+	x := randBytes(100)
+	noID := []byte(fmt.Sprintf(`{"title":"X.jpg","description":"newer","photoTakenTime":{"timestamp":"%d"}}`, tJuly))
+	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+		{gp + "Photos from 2022/X.jpg", x},
+		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", noID},
+	}), Options{})
+	r := f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+		{gp + "Photos from 2022/X.jpg", x},
+		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, `,"description":"older"`)},
+	}), Options{})
+	if r.Promoted != 1 {
+		t.Fatalf("older export: %+v", r)
+	}
+	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "XXX#original")
+	if it == nil {
+		t.Fatal("identity from the older export not applied")
+	}
+	sc, _ := f.st.GetSidecar(f.ctx, it.ID)
+	if sc == nil || !bytes.Contains(sc.JSON, []byte(`"newer"`)) || sc.ExportID != "20261106T000000Z-1" {
+		t.Errorf("newer stored sidecar replaced by the older export's: %+v", sc)
+	}
+	if !bytes.Contains(f.read(it.LibPath+".json"), []byte(`"newer"`)) {
+		t.Error("sidecar file does not hold the newer metadata")
+	}
+	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+		t.Errorf("verify: %v %v", err, v.Problems)
+	}
+}
+
+// A replaced part no longer carries a sidecar it had supplied for media in
+// another part: the metadata stays but its provenance is cleared, and a later
+// exact sidecar from any export replaces it.
+func TestReplacedPartReleasesOrphanedSidecars(t *testing.T) {
+	f := newFixture(t)
+	const export = "20261006T035113Z-1"
+	p1 := "takeout-" + export + "-001.zip"
+	f.ingest("leo", f.zip(p1, []file{
+		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, `,"description":"from part 1"`)},
+		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
+	}), Options{})
+	f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+		{gp + "Photos from 2022/A.jpg", randBytes(100)},
+		{gp + "Photos from 2022/B.jpg", randBytes(110)},
+	}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	a, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original")
+	b, _ := f.st.FindItemByKey(f.ctx, acct.ID, "BBB#original")
+	if a == nil || b == nil {
+		t.Fatal("pending sidecars not applied by part 2")
+	}
+	// the replacement of part 1 keeps B's sidecar but drops A's
+	r := f.ingest("leo", f.zip(p1, []file{
+		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
+	}), Options{Replace: true})
+	if !r.Replaced || r.SidecarsOrphaned != 1 {
+		t.Fatalf("replacement: %+v", r)
+	}
+	sa, _ := f.st.GetSidecar(f.ctx, a.ID)
+	sb, _ := f.st.GetSidecar(f.ctx, b.ID)
+	if sa == nil || sa.ExportID != "" || !bytes.Contains(sa.JSON, []byte("from part 1")) {
+		t.Errorf("orphaned sidecar: %+v", sa)
+	}
+	if sb == nil || sb.ExportID != export || sb.PartNo != 1 {
+		t.Errorf("confirmed sidecar lost its provenance: %+v", sb)
+	}
+	f.mustExist("leo/library/2022/07/A.jpg.json")
+	// a later export resending the photo with its sidecar replaces the orphaned
+	// one (unknown provenance never wins)
+	r = f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+		{gp + "Photos from 2022/A.jpg", f.read("leo/library/2022/07/A.jpg")},
+		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, `,"description":"resent"`)},
+	}), Options{})
+	if r.Failed != 0 {
+		t.Fatalf("later export: %+v", r)
+	}
+	if sa, _ = f.st.GetSidecar(f.ctx, a.ID); sa == nil || !bytes.Contains(sa.JSON, []byte("resent")) || sa.ExportID != "20261106T000000Z-1" {
+		t.Errorf("orphaned sidecar not replaced by a later exact one: %+v", sa)
+	}
+	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+		t.Errorf("verify: %v %v", err, v.Problems)
+	}
+}
+
+// Media seen only in an album whose membership a newer complete listing then
+// withdrew still receives its delayed sidecar: identity and metadata are
+// applied, the album link stays retired.
+func TestLateSidecarReachesPrunedAlbumOccurrence(t *testing.T) {
+	f := newFixture(t)
+	a := randBytes(100)
+	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
+	// export C part 1: the photo only in the album, without its sidecar
+	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+		{gp + "Trip /metadata.json", meta},
+		{gp + "Trip /A.jpg", a},
+	}), Options{})
+	f.mustExist("leo/albums/Trip to Austin/A.jpg")
+	// export D's complete listing no longer has it: membership withdrawn
+	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+		{gp + "Trip /metadata.json", meta},
+		{gp + "Trip /Z.jpg", randBytes(90)},
+		{gp + "Trip /Z.jpg.supplemental-metadata.json", sidecar("Z.jpg", "ZZZ", tJuly, "")},
+	}), Options{FullAlbums: true, Parts: 1})
+	if pres, err := f.ing.Prune(f.ctx, "leo", "20261106T000000Z-1", false); err != nil || pres.Removed != 1 {
+		t.Fatalf("prune: %+v %v", pres, err)
+	}
+	// export C part 2 arrives late with the sidecar
+	r := f.ingest("leo", f.zip("takeout-20261006T000000Z-1-002.zip", []file{
+		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
+	}), Options{})
+	if r.Promoted != 1 || r.PendingSidecars != 0 || r.Links != 0 {
+		t.Fatalf("late sidecar for a pruned occurrence: %+v", r)
+	}
+	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	if it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original"); it == nil {
+		t.Fatal("identity not applied")
+	}
+	f.mustExist("leo/library/2022/07/A.jpg", "leo/library/2022/07/A.jpg.json")
+	if f.exists("leo/albums/Trip to Austin/A.jpg") {
+		t.Error("withdrawn album link recreated by the late sidecar")
+	}
+	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+		t.Errorf("verify: %v %v", err, v.Problems)
+	}
+}
+
+// While a part's replacement is pending, an identical sidecar from an older
+// export does not confirm the part; the release still happens when the
+// replacement finishes without that sidecar.
+func TestOlderExportDoesNotConfirmReplacedPartSidecar(t *testing.T) {
+	f := newFixture(t)
+	const export = "20261106T000000Z-1"
+	p1 := "takeout-" + export + "-001.zip"
+	a := randBytes(100)
+	sc := sidecar("A.jpg", "AAA", tJuly, `,"description":"same"`)
+	f.ingest("leo", f.zip(p1, []file{{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sc}}), Options{})
+	f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Photos from 2022/A.jpg", a}}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	arch, _ := f.st.GetArchive(f.ctx, acct.ID, export, 1)
+	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original")
+	// sync found part 1 replaced: pending re-ingest
+	if err := f.st.ResetPartForReingest(f.ctx, arch.ID, acct.ID, export, 1); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ := f.st.GetSidecar(f.ctx, it.ID); row == nil || !row.Reconfirm {
+		t.Fatalf("sidecar of the replaced part not awaiting confirmation: %+v", row)
+	}
+	// an older export delivers the photo with the identical sidecar meanwhile
+	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+		{gp + "Photos from 2022/A.jpg", a},
+		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sc},
+	}), Options{})
+	if row, _ := f.st.GetSidecar(f.ctx, it.ID); row == nil || !row.Reconfirm || row.ExportID != export || row.PartNo != 1 {
+		t.Fatalf("older export confirmed or took over the sidecar: %+v", row)
+	}
+	// the replacement arrives without the sidecar: provenance released
+	r := f.ingest("leo", f.zip(p1, []file{{gp + "Photos from 2022/Other.jpg.supplemental-metadata.json", sidecar("Other.jpg", "OOO", tJuly, "")}}), Options{})
+	if r.SidecarsOrphaned != 1 {
+		t.Fatalf("replacement: %+v", r)
+	}
+	if row, _ := f.st.GetSidecar(f.ctx, it.ID); row == nil || row.ExportID != "" || row.Reconfirm {
+		t.Errorf("dropped sidecar kept its provenance: %+v", row)
+	}
+}
+
+// A replacement keeps a sidecar but moves its media to a later part: the
+// sidecar is stored as pending despite the old (reset) occurrence, and the
+// later part's media picks it up.
+func TestReplacementMovingMediaToLaterPartKeepsSidecarPending(t *testing.T) {
+	f := newFixture(t)
+	const export = "20261006T035113Z-1"
+	p1 := "takeout-" + export + "-001.zip"
+	a := randBytes(100)
+	f.ingest("leo", f.zip(p1, []file{
+		{gp + "Photos from 2022/A.jpg", a},
+		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
+	}), Options{})
+	r := f.ingest("leo", f.zip(p1, []file{
+		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, `,"description":"corrected"`)},
+	}), Options{Replace: true})
+	if !r.Replaced || r.PendingSidecars != 1 {
+		t.Fatalf("replacement without the media: %+v", r)
+	}
+	r = f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Photos from 2022/A.jpg", a}}), Options{})
+	if r.Changed != 1 {
+		t.Fatalf("media in the later part: %+v", r)
+	}
+	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original")
+	if sc, _ := f.st.GetSidecar(f.ctx, it.ID); sc == nil || !bytes.Contains(sc.JSON, []byte("corrected")) || sc.PartNo != 1 {
+		t.Errorf("corrected sidecar not applied via pending: %+v", sc)
+	}
+	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+		t.Errorf("verify: %v %v", err, v.Problems)
+	}
+}
+
+// Merging a fallback item that carries a newer export's sidecar into the
+// item holding its Google id keeps that newer metadata on the survivor, even
+// when the sidecar establishing the identity comes from an older export.
+func TestMergeKeepsNewerFallbackSidecar(t *testing.T) {
+	f := newFixture(t)
+	x := randBytes(100)
+	// the identity holder, from an older export, with its own sidecar
+	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+		{gp + "Photos from 2022/X.jpg", x},
+		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, `,"description":"older"`)},
+	}), Options{})
+	// a newer export: same photo under another name, sidecar without a Google id
+	noID := []byte(fmt.Sprintf(`{"title":"X2.jpg","description":"newer","photoTakenTime":{"timestamp":"%d"}}`, tJuly))
+	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+		{gp + "Photos from 2022/X2.jpg", x},
+		{gp + "Photos from 2022/X2.jpg.supplemental-metadata.json", noID},
+	}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	fb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "occ:20261106T000000Z-1#Photos from 2022#X2.jpg")
+	if fb == nil {
+		t.Fatal("fallback item not found")
+	}
+	// the newer export's part is meanwhile being replaced: its sidecar awaits reconfirmation
+	fbArch, _ := f.st.GetArchive(f.ctx, acct.ID, "20261106T000000Z-1", 1)
+	if err := f.st.ResetPartForReingest(f.ctx, fbArch.ID, acct.ID, "20261106T000000Z-1", 1); err != nil {
+		t.Fatal(err)
+	}
+	// a delayed part of the older export identifies the fallback: promotion merges it
+	pr := &partRun{ing: f.ing, ctx: f.ctx, acct: acct, part: PartMeta{Account: "leo", ExportID: "20261006T000000Z-1", PartNo: 2, Name: "takeout-20261006T000000Z-1-002.zip"}, folders: map[string]*folderCtx{}}
+	arriving, err := takeoutParse(sidecar("X2.jpg", "XXX", tJuly, `,"description":"older too"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pr.promote(fb, arriving, "original", "XXX", "XXX#original"); err != nil {
+		t.Fatal(err)
+	}
+	target, _ := f.st.FindItemByKey(f.ctx, acct.ID, "XXX#original")
+	sc, _ := f.st.GetSidecar(f.ctx, target.ID)
+	if sc == nil || !bytes.Contains(sc.JSON, []byte(`"newer"`)) || sc.ExportID != "20261106T000000Z-1" {
+		t.Errorf("newer metadata lost in the merge: %+v", sc)
+	}
+	if sc != nil && !sc.Reconfirm {
+		t.Error("the pending reconfirmation did not follow the sidecar to the survivor")
+	}
+	if c, _ := f.st.Counts(f.ctx, acct.ID); c["items"] != 1 {
+		t.Errorf("items after merge: %d", c["items"])
+	}
+	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+		t.Errorf("verify: %v %v", err, v.Problems)
+	}
+}
+
+func takeoutParse(raw []byte) (*takeout.Sidecar, error) { return takeout.ParseSidecar(raw) }
+
+// After a replacement dropped a media entry, a later part's sidecar of the
+// same name is not applied to the removed photo: it waits for its media.
+func TestRemovedEntryDoesNotTakeLaterSidecar(t *testing.T) {
+	f := newFixture(t)
+	const export = "20261006T035113Z-1"
+	p1 := "takeout-" + export + "-001.zip"
+	f.ingest("leo", f.zip(p1, []file{{gp + "Photos from 2022/A.jpg", randBytes(100)}}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	removed, _ := f.st.FindItemByKey(f.ctx, acct.ID, "occ:"+export+"#Photos from 2022#A.jpg")
+	if removed == nil {
+		t.Fatal("fallback item not found")
+	}
+	// the replacement no longer carries A.jpg
+	r := f.ingest("leo", f.zip(p1, []file{{gp + "Photos from 2022/Z.jpg", randBytes(90)}}), Options{Replace: true})
+	if !r.Replaced {
+		t.Fatalf("replacement: %+v", r)
+	}
+	// a later part brings a sidecar named for A.jpg: not for the removed photo
+	r = f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
+	}), Options{})
+	if r.Promoted != 0 || r.PendingSidecars != 1 {
+		t.Fatalf("sidecar applied to a removed entry: %+v", r)
+	}
+	if it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original"); it != nil {
+		t.Error("removed photo took the later sidecar's identity")
+	}
+	if sc, _ := f.st.GetSidecar(f.ctx, removed.ID); sc != nil {
+		t.Error("removed photo received a sidecar")
+	}
+}
+
+// While a part is being replaced, a fallback sidecar from that part that still
+// awaits reconfirmation does not displace the target's sidecar the replacement
+// has already confirmed.
+func TestMergePrefersConfirmedTargetSidecar(t *testing.T) {
+	f := newFixture(t)
+	x := randBytes(100)
+	const export = "20261106T000000Z-1"
+	noID := []byte(fmt.Sprintf(`{"title":"X2.jpg","description":"fallback copy","photoTakenTime":{"timestamp":"%d"}}`, tJuly))
+	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+		{gp + "Photos from 2022/X.jpg", x},
+		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, `,"description":"confirmed"`)},
+		{gp + "Photos from 2022/X2.jpg", x},
+		{gp + "Photos from 2022/X2.jpg.supplemental-metadata.json", noID},
+	}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	target, _ := f.st.FindItemByKey(f.ctx, acct.ID, "XXX#original")
+	fb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "occ:"+export+"#Photos from 2022#X2.jpg")
+	arch, _ := f.st.GetArchive(f.ctx, acct.ID, export, 1)
+	if err := f.st.ResetPartForReingest(f.ctx, arch.ID, acct.ID, export, 1); err != nil {
+		t.Fatal(err)
+	}
+	// another part of the same export has confirmed the target's sidecar, not
+	// (yet) the fallback's
+	if err := f.st.SetSidecarExport(f.ctx, target.ID, export, 2); err != nil {
+		t.Fatal(err)
+	}
+	pr := &partRun{ing: f.ing, ctx: f.ctx, acct: acct, part: PartMeta{Account: "leo", ExportID: "20261006T000000Z-1", PartNo: 2, Name: "takeout-20261006T000000Z-1-002.zip"}, folders: map[string]*folderCtx{}}
+	arriving, _ := takeoutParse(sidecar("X2.jpg", "XXX", tJuly, `,"description":"older"`))
+	if _, err := pr.promote(fb, arriving, "original", "XXX", "XXX#original"); err != nil {
+		t.Fatal(err)
+	}
+	sc, _ := f.st.GetSidecar(f.ctx, target.ID)
+	if sc == nil || !bytes.Contains(sc.JSON, []byte(`"confirmed"`)) || sc.Reconfirm {
+		t.Errorf("confirmed target sidecar displaced or flagged: %+v", sc)
 	}
 }
