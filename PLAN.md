@@ -640,7 +640,12 @@ non-zero as a failed unit; the Telegram report carries the detail.
 1. **One rclone remote per account.** The permission grant is a browser step and happens
    **once per account, never on the server and never inside the container**. The resulting
    refresh token is not tied to a machine, so it is created wherever a browser is and then
-   copied. Three ways, pick per person:
+   copied. Use an **own Google OAuth client id** (one Cloud project with the Drive API
+   enabled and a Desktop-app OAuth client, both people added as test users; pass
+   `client_id=... client_secret=...` to `rclone config create`): with rclone's shared
+   built-in client id Google throttled downloads to ~9 MB/s average with `rateLimitExceeded`
+   back-offs (measured 2026-10-09), with an own id the four streams run at ~50 MB/s. Three
+   ways, pick per person:
    - *On a laptop that has rclone* (what was done for `gdrive` on 2026-10-05):
      `rclone config create gdrive-jane drive scope=drive`. The browser opens; sign in as
      that person (a private window avoids picking the wrong Google account). The new

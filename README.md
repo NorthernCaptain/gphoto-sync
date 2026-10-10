@@ -14,10 +14,14 @@ timer. Design and decisions: [PLAN.md](PLAN.md).
 
 ## One-time setup
 
-1. **rclone remote per account** (on a machine with a browser, never on the server):
-   `rclone config create gdrive-<name> drive scope=drive`, then copy the resulting section(s)
-   into `config/rclone/rclone.conf` on the server (mode 0600). See PLAN.md 3.7 for the
-   headless variants.
+1. **rclone remote per account** (on a machine with a browser, never on the server), with
+   your **own Google OAuth client id**: rclone's built-in client id is shared by every rclone
+   user and Google throttles it (`rateLimitExceeded`, about 9 MB/s average here; 50 MB/s with
+   an own id). Create it once as described at https://rclone.org/drive/#making-your-own-client-id
+   (Drive API enabled, OAuth client of type Desktop app, your accounts as test users), then
+   `rclone config create gdrive-<name> drive scope=drive client_id=<id> client_secret=<secret>`
+   and copy the resulting section(s) into `config/rclone/rclone.conf` on the server (mode
+   0600). The same client id serves every account. See PLAN.md 3.7 for the headless variants.
 2. **Takeout schedule per account** at takeout.google.com while signed in as that person:
    Google Photos only, monthly for one year, incremental after the first export,
    destination **Add to Drive**, zip, 50 GB parts.
