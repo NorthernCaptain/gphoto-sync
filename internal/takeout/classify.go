@@ -111,6 +111,12 @@ func Classify(name string, size int64, r Rules) (e Entry, ok bool) {
 	return e, true
 }
 
+// ClassifyFolder tells the kind of a Takeout folder by its name.
+func ClassifyFolder(folder string, r Rules) FolderKind {
+	k, _ := classifyFolder(folder, r)
+	return k
+}
+
 func classifyFolder(folder string, r Rules) (FolderKind, int) {
 	for _, p := range r.YearPrefixes {
 		if strings.HasPrefix(folder, p) {

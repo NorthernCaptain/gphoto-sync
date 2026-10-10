@@ -2083,6 +2083,89 @@ func TestReplacedPartReopensConsumedSidecar(t *testing.T) {
 	}
 }
 
+// Stored sidecars of an album whose photos only get their identity in the
+// same resolution (title-named sidecars of a year folder applied to fallback
+// items, as after an upgrade) are linked in that same call, whatever the
+// folder order.
+func TestResolvePendingLinksPhotosPromotedInTheSameCall(t *testing.T) {
+	f := newFixture(t)
+	const export = "20261006T035113Z-1"
+	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
+	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+		{gp + "Photos from 2022/X.jpg", randBytes(70)},
+		{gp + "Trip /metadata.json", meta},
+		{gp + "Trip /Z.jpg", randBytes(60)},
+	}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	raw := sidecar("X", "XXX", tJuly, "")
+	for _, folder := range []string{"Photos from 2022", "Trip "} {
+		if err := f.st.PutPendingSidecar(f.ctx, acct.ID, export, 1, folder, "X", raw, "XXX"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	links, promoted, err := f.ing.ResolvePending(f.ctx, acct, export, false)
+	if err != nil || promoted != 1 || links != 1 {
+		t.Fatalf("one call: links %d promoted %d err %v", links, promoted, err)
+	}
+	f.mustExist("leo/albums/Trip to Austin/X.jpg")
+	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 {
+		t.Errorf("pending: %d", n)
+	}
+	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+		t.Errorf("verify: %v %v", err, v.Problems)
+	}
+}
+
+// Stored sidecars of an excluded folder (rows from before the exclusion
+// covered sidecars) are dropped: nothing waits for them.
+func TestExcludedFolderPendingRowsDropped(t *testing.T) {
+	f := newFixture(t)
+	const export = "20261006T035113Z-1"
+	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{{gp + "Photos from 2022/A.jpg", randBytes(70)}}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	if err := f.st.PutPendingSidecar(f.ctx, acct.ID, export, 1, "Trash", "T.jpg", sidecar("T.jpg", "TTT", tJuly, ""), "TTT"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.ing.ResolvePending(f.ctx, acct, export, false); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 {
+		t.Errorf("pending: %d", n)
+	}
+	// a folder ingested while it was included keeps its rows
+	f.ing.cfg.Takeout.IncludeTrash = true
+	f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Trash/U.jpg", randBytes(71)}}), Options{})
+	f.ing.cfg.Takeout.IncludeTrash = false
+	if err := f.st.PutPendingSidecar(f.ctx, acct.ID, export, 1, "Trash", "V.jpg", sidecar("V.jpg", "VVV", tJuly, ""), "VVV"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.ing.ResolvePending(f.ctx, acct, export, false); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 1 {
+		t.Errorf("row of an ingested folder dropped: pending %d", n)
+	}
+}
+
+// A year-folder sidecar of a photo whose file the export delivered in an
+// album folder only is consumed, not waited for.
+func TestYearFolderSidecarOfPhotoDeliveredInAlbumResolved(t *testing.T) {
+	f := newFixture(t)
+	const export = "20261006T035113Z-1"
+	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
+	r := f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+		{gp + "Trip /metadata.json", meta},
+		{gp + "Trip /X.jpg", randBytes(70)},
+		{gp + "Trip /X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, "")},
+		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, "")},
+	}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 || r.Added != 1 {
+		t.Errorf("pending %d: %+v", n, r)
+	}
+	f.mustExist("leo/albums/Trip to Austin/X.jpg")
+}
+
 // A stored sidecar whose source part is unknown (rows from before part
 // tracking) never makes an album membership: it could not be withdrawn with
 // its part.

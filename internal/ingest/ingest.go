@@ -1780,7 +1780,21 @@ func (pr *partRun) applyLateSidecars(fc *folderCtx, doneMedia, prevFailed map[st
 // that photo once the photo turns up elsewhere in the export, and the photo's
 // new version only once the export is complete (complete) without it. It
 // returns the number of album links and promotions made.
+//
+// A promotion may name the photo an album's stored sidecar waits for, so
+// passes repeat while promotions happen.
 func (ing *Ingester) ResolvePending(ctx context.Context, acct *store.Account, exportID string, complete bool) (links, promoted int, err error) {
+	for pass := 0; pass < 4; pass++ {
+		l, p, err := ing.resolvePendingPass(ctx, acct, exportID, complete)
+		links, promoted = links+l, promoted+p
+		if err != nil || p == 0 {
+			return links, promoted, err
+		}
+	}
+	return links, promoted, nil
+}
+
+func (ing *Ingester) resolvePendingPass(ctx context.Context, acct *store.Account, exportID string, complete bool) (links, promoted int, err error) {
 	rows, err := ing.st.PendingSidecarsOfExport(ctx, acct.ID, exportID)
 	if err != nil || len(rows) == 0 {
 		return 0, 0, err
@@ -1790,6 +1804,7 @@ func (ing *Ingester) ResolvePending(ctx context.Context, acct *store.Account, ex
 		byFolder[r.Folder] = append(byFolder[r.Folder], r)
 	}
 	for folder, prs := range byFolder {
+		kind := takeout.ClassifyFolder(folder, ing.rules)
 		occs, err := ing.st.OccurrencesInFolder(ctx, acct.ID, exportID, folder)
 		if err != nil {
 			return links, promoted, err
@@ -1799,6 +1814,19 @@ func (ing *Ingester) ResolvePending(ctx context.Context, acct *store.Account, ex
 			if o.ItemID != 0 && o.State != store.OccReset && o.State != store.OccRemoved && !isSidecarOnlyEntry(o.EntryName) {
 				byEntry[strings.ToLower(o.EntryName)] = o
 			}
+		}
+		excluded := (kind == takeout.FolderTrash && !ing.cfg.Takeout.IncludeTrash) || (kind == takeout.FolderArchive && !ing.cfg.Takeout.IncludeArchive)
+		if excluded && len(byEntry) == 0 {
+			// sidecars of an excluded folder (stored before the exclusion covered
+			// sidecars) whose media the export never ingested: nothing waits for
+			// them. A folder ingested while it was included keeps its rows: its
+			// media may still need them
+			for _, r := range prs {
+				if err := ing.st.DeletePendingSidecar(ctx, acct.ID, exportID, folder, r.Key); err != nil {
+					return links, promoted, err
+				}
+			}
+			continue
 		}
 		// the album this export attached the folder to (recorded when the folder
 		// was seen; a folder name recurs across exports for different albums);
@@ -1938,7 +1966,25 @@ func (ing *Ingester) ResolvePending(ctx context.Context, acct *store.Account, ex
 			}
 			// an album membership of a photo known by its Google id
 			gid := sc.GoogleID()
-			if album == nil || gid == "" {
+			if gid == "" {
+				continue
+			}
+			if kind == takeout.FolderYear {
+				// Takeout can write a photo's sidecar into its year folder while
+				// the file itself sits in an album folder only: the known photo
+				// has its sidecar from there, this copy is consumed
+				if known, err := ing.st.ItemsByGoogleIDAny(ctx, acct.ID, gid); err != nil {
+					return links, promoted, err
+				} else if known != nil {
+					if elsewhere, err := ing.st.PhotoDeliveredElsewhereInExport(ctx, acct.ID, gid, exportID, folder, r.Key); err != nil {
+						return links, promoted, err
+					} else if elsewhere {
+						_ = ing.st.MarkPendingResolved(ctx, acct.ID, exportID, folder, r.Key)
+					}
+				}
+				continue
+			}
+			if album == nil {
 				continue
 			}
 			variant := takeout.VariantOriginal
