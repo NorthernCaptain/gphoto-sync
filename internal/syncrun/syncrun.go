@@ -458,6 +458,13 @@ func (r *Runner) fetch(ctx context.Context, remoteName string, f rclone.RemoteFi
 		return fmt.Errorf("not enough free space in inbox: need %.1f GB, have %.1f GB", float64(f.Size)*1.1/1e9, float64(free)/1e9)
 	}
 	_ = os.Remove(local)
+	// rclone writes <name>.<random>.partial and renames at the end; an
+	// interrupted run leaves that behind, 50 GB of it
+	if leftovers, err := filepath.Glob(local + ".*.partial"); err == nil {
+		for _, p := range leftovers {
+			_ = os.Remove(p)
+		}
+	}
 	r.Log.Info("fetching part", "name", f.Name, "size_gb", fmt.Sprintf("%.1f", float64(f.Size)/1e9))
 	if err := r.RC.CopyID(ctx, remoteName, f.ID, local); err != nil {
 		return err
