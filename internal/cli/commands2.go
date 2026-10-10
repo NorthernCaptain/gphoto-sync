@@ -84,6 +84,19 @@ func wants(list []string, outcome string) bool {
 	return false
 }
 
+// humanSize formats a byte count for listings (GB for parts, smaller units
+// for stray files such as Takeout's archive_browser.html zip).
+func humanSize(n int64) string {
+	switch {
+	case n >= 1e9:
+		return fmt.Sprintf("%.1f GB", float64(n)/1e9)
+	case n >= 1e6:
+		return fmt.Sprintf("%.1f MB", float64(n)/1e6)
+	default:
+		return fmt.Sprintf("%.0f KB", float64(n)/1e3)
+	}
+}
+
 func cmdCheckRemote(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("check-remote", flag.ContinueOnError)
 	cfgPath := commonFlags(fs)
@@ -132,7 +145,7 @@ func cmdCheckRemote(ctx context.Context, args []string) int {
 			if _, _, ok := ingest.ParsePartName(f.Name); !ok {
 				mark = " (not a takeout part, ignored)"
 			}
-			fmt.Printf("  %s  %.1f GB  %s  %s%s\n", f.Name, float64(f.Size)/1e9, f.ModTime.Format(time.RFC3339), state, mark)
+			fmt.Printf("  %s  %s  %s  %s%s\n", f.Name, humanSize(f.Size), f.ModTime.Format(time.RFC3339), state, mark)
 		}
 		if len(files) == 0 {
 			fmt.Println("  (empty)")
