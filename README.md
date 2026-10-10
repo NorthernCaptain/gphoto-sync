@@ -25,10 +25,15 @@ timer. Design and decisions: [PLAN.md](PLAN.md).
    - `/home/leo/gphoto-sync` — this repo; `config/` is git- and docker-ignored and holds
      `config.yaml` (start from `config/config.example.yaml`), `rclone/rclone.conf`,
      `telegram.token`.
-   - `/home/leo/gphoto-backup/data` — the library; `/home/leo/gphoto-backup/state` — SQLite
-     database, inbox staging (needs ~60 GB free) and the writer lock `gphoto-sync.lock`
-     (a second `sync`/`ingest` started while one runs exits 1 at once);
-     `/home/leo/gphoto-backup/downloads` — manually downloaded parts for `ingest`.
+   - `/home/leo/gphoto-backup/data` — the library; a symlink to
+     `/media/media_disk/gphoto-backup/data` on the backup HDD (ext4: album links are
+     hardlinks, and the ingest moves each file from `data/<account>/.tmp` into place with
+     `rename()`, so the temp dir must stay on the same filesystem as the library). The
+     service has `RequiresMountsFor=/media/media_disk` and does not start without the disk.
+     `/home/leo/gphoto-backup/state` (SSD) — SQLite database, inbox staging (needs ~60 GB
+     free) and the writer lock `gphoto-sync.lock` (a second `sync`/`ingest` started while
+     one runs exits 1 at once); `/home/leo/gphoto-backup/downloads` — manually downloaded
+     parts for `ingest`.
 4. **Build and install**:
    ```sh
    cd /home/leo/gphoto-sync && DOCKER_BUILDKIT=0 docker build -t gphoto-sync:local .

@@ -3,6 +3,11 @@ Description=Google Photos Takeout sync (one-shot container)
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
+# The library lives on the backup disk (reached through the symlink
+# /home/leo/gphoto-backup/data). Without this, a run while the disk is not
+# mounted would make Docker create the bind source on the root filesystem
+# and ingest into it.
+RequiresMountsFor=/media/media_disk
 
 [Service]
 Type=exec

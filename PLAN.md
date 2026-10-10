@@ -678,11 +678,13 @@ non-zero as a failed unit; the Telegram report carries the detail.
      `docker build -t gphoto-sync:local .`; `config/` holds `config.yaml`,
      `rclone/rclone.conf`, `telegram.token` and is excluded both by `.gitignore` and by
      `.dockerignore`, so credentials never enter the build context or an image layer.
-   - `/home/leo/gphoto-backup/data` — all accounts' `library/` and `albums/`;
-     `/home/leo/gphoto-backup/state` — DB and inbox staging, kept next to the data so
-     both move together when the extra disk comes (DB paths are `data_dir`-relative);
-     `/home/leo/gphoto-backup/downloads` — manually downloaded parts for
-     `gphoto-sync ingest` (part 1 of the 2026-10-06 export is already there).
+   - `/home/leo/gphoto-backup/data` — all accounts' `library/` and `albums/`; since
+     2026-10-09 a symlink to `/media/media_disk/gphoto-backup/data` on the backup HDD
+     (ext4, so hardlinks and the same-filesystem `rename()` from `.tmp` keep working; the
+     unit has `RequiresMountsFor=/media/media_disk`). `/home/leo/gphoto-backup/state` —
+     DB and inbox staging, on the SSD (DB paths are `data_dir`-relative, so the library
+     can move again without touching the DB); `/home/leo/gphoto-backup/downloads` —
+     manually downloaded parts for `gphoto-sync ingest`.
 5. **Install units** from 3.8, `systemctl enable --now gphoto-sync.timer`, and run the first
    pass by hand with `systemctl start gphoto-sync.service` while watching
    `journalctl -fu gphoto-sync` and the Telegram chat.
