@@ -16,11 +16,13 @@ import (
 	"gphoto-sync/internal/store"
 )
 
-// fakeRemote serves fixed listings and records deletions.
+// fakeRemote serves fixed listings and records deletions; CopyID serves a
+// local file per Drive id when one is registered in files.
 type fakeRemote struct {
 	listings map[string][]rclone.RemoteFile
 	deleted  []string
 	listErr  map[string]error
+	files    map[string]string
 }
 
 func (f *fakeRemote) List(_ context.Context, remote string) ([]rclone.RemoteFile, error) {
@@ -29,7 +31,17 @@ func (f *fakeRemote) List(_ context.Context, remote string) ([]rclone.RemoteFile
 	}
 	return f.listings[remote], nil
 }
-func (f *fakeRemote) CopyID(context.Context, string, string, string) error { return nil }
+func (f *fakeRemote) CopyID(_ context.Context, _, id, dest string) error {
+	src, ok := f.files[id]
+	if !ok {
+		return nil
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dest, data, 0o644)
+}
 func (f *fakeRemote) MoveID(context.Context, string, string, string) error { return nil }
 func (f *fakeRemote) DeleteFile(_ context.Context, p string) error {
 	f.deleted = append(f.deleted, p)

@@ -453,7 +453,9 @@ host                                   container (docker run --rm, weekly, exits
    listing are looked up by id in the staging folder and deleted from there; one absent
    from both is gone and recorded as deleted. Then fetch the next part.
 8. **Report**: print a summary (parts seen/ingested/failed, media added, duplicates,
-   links, duration) and send it to Telegram (3.9), on success as well as on failure. If the
+   links, duration) and send it to Telegram (3.9), on success as well as on failure. A run
+   that changed the library ends the report with what every account holds on disk and the
+   total over all accounts. If the
    newest export timestamp is older than `expected_interval + grace` (default 30 + 14 days),
    the yearly schedule has probably lapsed: log at error level, exit with code 3, and say
    so in the Telegram message.
@@ -824,7 +826,14 @@ tag or entity is cut and Telegram's 4096-character limit is never hit. Content p
 account: the parts seen, fetched, ingested, partial or failed; items added, duplicates
 skipped, album links created; the newest export date and the overdue flag; exports that
 look complete but await `exports confirm`; failed and given-up entries (first few, with the
-part name); duration; the exit code. A send failure
+part name); duration; the exit code. When the run changed the library (a part was ingested,
+or an account's photo, video, album, link or byte totals moved, by resolved sidecars or
+pruning), the message ends with a **Library** block: per configured account its photos,
+videos (motion-photo companions count as videos), albums holding at least one link, and bytes
+on disk (distinct blobs of items and kept versions; album copies on top of that under
+`link_mode: copy`), and, with more than one configured account, the same for them together,
+where bytes shared between accounts by hardlink count once. An account never ingested shows
+zeros. A run that changed nothing carries no such block. A send failure
 is logged and does not change the exit code. `telegram test` sends a canned
 message to confirm the wiring.
 

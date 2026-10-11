@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"gphoto-sync/internal/ingest"
 	"gphoto-sync/internal/rclone"
 	"gphoto-sync/internal/store"
+	"gphoto-sync/internal/takeout"
 	"gphoto-sync/internal/telegram"
 )
 
@@ -63,15 +65,33 @@ type AccountReport struct {
 	Notes          []string // noteworthy, non-failing events (replaced parts, unverifiable matches)
 	Exit           int
 	DuplicateNames []string
+	Changed        bool // the run changed the library: a part was ingested or the totals moved
 }
 
 // Report is the outcome of a whole run.
 type Report struct {
-	Started  time.Time
-	Finished time.Time
-	Accounts []*AccountReport
-	Exit     int
-	Fatal    string
+	Started      time.Time
+	Finished     time.Time
+	Accounts     []*AccountReport
+	Exit         int
+	Fatal        string
+	Library      []*Library // what every account holds on disk; filled when the run changed something
+	LibraryTotal *Library   // every account together, when there are several
+}
+
+// Library is what a library holds on disk: one account's, or every
+// account's together.
+type Library struct {
+	Name   string // account name, or "all accounts"
+	Photos int    // items that are not videos, edited copies included
+	Videos int    // items with a video extension, motion-photo companions included
+	Albums int
+	Links  int
+	Bytes  int64
+}
+
+func (l *Library) line() string {
+	return fmt.Sprintf("%s, %s, %s, %s on disk", plural(l.Photos, "photo"), plural(l.Videos, "video"), plural(l.Albums, "album"), HumanSize(l.Bytes))
 }
 
 // Remote is the part of the rclone client the runner uses (*rclone.Client
@@ -118,11 +138,114 @@ func (r *Runner) Run(ctx context.Context, accounts []string, dryRun bool) *Repor
 			break
 		}
 	}
+	if !dryRun && ctx.Err() == nil && rep.changed() {
+		r.summarize(ctx, rep)
+	}
 	rep.Finished = r.Now()
 	return rep
 }
 
+// runAccount syncs one account and tells whether the library changed.
 func (r *Runner) runAccount(ctx context.Context, name string, dryRun bool) *AccountReport {
+	var before *Library
+	if !dryRun {
+		before = r.snapshot(ctx, name)
+	}
+	ar := r.syncAccount(ctx, name, dryRun)
+	ar.Changed = len(ar.Results) > 0
+	if before != nil && ctx.Err() == nil {
+		if after := r.snapshot(ctx, name); after != nil && *after != *before {
+			ar.Changed = true
+		}
+	}
+	return ar
+}
+
+// snapshot reads what an account holds on disk; an account never ingested
+// holds nothing. A failed read is logged and returns nil.
+func (r *Runner) snapshot(ctx context.Context, name string) *Library {
+	acct, err := r.St.GetAccount(ctx, name)
+	if err == nil && acct == nil {
+		return &Library{Name: name}
+	}
+	var l *Library
+	if err == nil {
+		l, err = r.library(ctx, name, []int64{acct.ID})
+	}
+	if err != nil {
+		r.Log.Warn("library totals", "account", name, "err", err)
+		return nil
+	}
+	return l
+}
+
+// library reads the totals of the given accounts together. Album links made
+// as copies take their bytes on disk again.
+func (r *Runner) library(ctx context.Context, name string, accountIDs []int64) (*Library, error) {
+	t, err := r.St.LibraryTotals(ctx, accountIDs)
+	if err != nil {
+		return nil, err
+	}
+	l := &Library{Name: name, Albums: t.Albums, Links: t.Links, Bytes: t.Bytes}
+	if r.Cfg.Layout.LinkMode == "copy" {
+		l.Bytes += t.LinkBytes
+	}
+	for ext, n := range t.ByExt {
+		if takeout.IsVideoName("x" + ext) {
+			l.Videos += n
+		} else {
+			l.Photos += n
+		}
+	}
+	return l, nil
+}
+
+// changed tells whether any account's library changed in this run.
+func (rep *Report) changed() bool {
+	for _, a := range rep.Accounts {
+		if a.Changed {
+			return true
+		}
+	}
+	return false
+}
+
+// summarize fills in what every configured account holds on disk (nothing
+// yet for one never ingested), and the total over the configured accounts
+// when there are several. A failed read leaves the report without the
+// summary.
+func (r *Runner) summarize(ctx context.Context, rep *Report) {
+	var libs []*Library
+	var ids []int64
+	for _, name := range r.Cfg.AccountNames() {
+		acct, err := r.St.GetAccount(ctx, name)
+		if err == nil && acct == nil {
+			libs = append(libs, &Library{Name: name})
+			continue
+		}
+		var l *Library
+		if err == nil {
+			l, err = r.library(ctx, name, []int64{acct.ID})
+		}
+		if err != nil {
+			r.Log.Warn("library totals", "account", name, "err", err)
+			return
+		}
+		libs = append(libs, l)
+		ids = append(ids, acct.ID)
+	}
+	var total *Library
+	if len(libs) > 1 {
+		var err error
+		if total, err = r.library(ctx, "all accounts", ids); err != nil {
+			r.Log.Warn("library totals", "account", "all", "err", err)
+			return
+		}
+	}
+	rep.Library, rep.LibraryTotal = libs, total
+}
+
+func (r *Runner) syncAccount(ctx context.Context, name string, dryRun bool) *AccountReport {
 	ar := &AccountReport{Name: name}
 	acc, ok := r.Cfg.Accounts[name]
 	if !ok {
@@ -848,7 +971,51 @@ func (rep *Report) HTML() string {
 			fmt.Fprintf(&b, "! %s\n", esc(e))
 		}
 	}
+	if len(rep.Library) > 0 {
+		b.WriteString("\n<b>Library</b>\n")
+		for _, l := range rep.Library {
+			fmt.Fprintf(&b, "%s: %s\n", esc(l.Name), l.line())
+		}
+		if rep.LibraryTotal != nil {
+			fmt.Fprintf(&b, "<b>%s</b>: %s\n", esc(rep.LibraryTotal.Name), rep.LibraryTotal.line())
+		}
+	}
 	return b.String()
+}
+
+// HumanSize formats a byte count: GB for libraries and parts, smaller units
+// for stray files such as Takeout's archive_browser.html zip.
+func HumanSize(n int64) string {
+	switch {
+	case n >= 1e9:
+		return fmt.Sprintf("%.1f GB", float64(n)/1e9)
+	case n >= 1e6:
+		return fmt.Sprintf("%.1f MB", float64(n)/1e6)
+	default:
+		return fmt.Sprintf("%.0f KB", float64(n)/1e3)
+	}
+}
+
+// commas renders 43591 as 43,591.
+func commas(n int) string {
+	s := strconv.Itoa(n)
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(s, "-")
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	if neg {
+		s = "-" + s
+	}
+	return s
+}
+
+// plural renders "1 photo", "2 photos", "43,591 photos".
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return commas(n) + " " + noun + "s"
 }
 
 // Text renders the report for the terminal.

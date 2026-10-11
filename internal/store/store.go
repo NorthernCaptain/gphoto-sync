@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -1537,6 +1538,64 @@ func (s *Store) Counts(ctx context.Context, accountID int64) (map[string]int, er
 	}
 	out["bytes"] = int(bytes.Int64)
 	return out, nil
+}
+
+// LibraryTotals are the numbers of a library as it stands on disk.
+type LibraryTotals struct {
+	Items     int            // files in the library tree, every variant
+	Albums    int            // albums holding at least one link (an album pruned empty loses its folder)
+	Links     int            // album links
+	Bytes     int64          // distinct blobs referenced by items and kept versions
+	LinkBytes int64          // bytes of the files the album links point to: on disk again when links are copies
+	ByExt     map[string]int // items per lower-case extension
+}
+
+// LibraryTotals counts what the given accounts' libraries hold together:
+// items, albums, album links, items per extension, and the bytes on disk,
+// every distinct blob an item or a kept version references. Bytes hardlinked
+// between accounts count once. No accounts means empty totals.
+func (s *Store) LibraryTotals(ctx context.Context, accountIDs []int64) (*LibraryTotals, error) {
+	t := &LibraryTotals{ByExt: map[string]int{}}
+	if len(accountIDs) == 0 {
+		return t, nil
+	}
+	in := "IN (?" + strings.Repeat(",?", len(accountIDs)-1) + ")"
+	args := make([]any, 0, 2*len(accountIDs))
+	for _, id := range accountIDs {
+		args = append(args, id)
+	}
+	for _, q := range []struct {
+		dst  any
+		sql  string
+		args []any
+	}{
+		{&t.Items, `SELECT COUNT(*) FROM items WHERE account_id ` + in, args},
+		{&t.Albums, `SELECT COUNT(DISTINCT ai.album_id) FROM album_items ai JOIN albums a ON a.id = ai.album_id WHERE a.account_id ` + in, args},
+		{&t.Links, `SELECT COUNT(*) FROM album_items ai JOIN albums a ON a.id = ai.album_id WHERE a.account_id ` + in, args},
+		{&t.Bytes, `SELECT COALESCE(SUM(size), 0) FROM blobs WHERE id IN (
+			SELECT blob_id FROM items WHERE account_id ` + in + `
+			UNION SELECT v.blob_id FROM item_versions v JOIN items i ON i.id = v.item_id WHERE i.account_id ` + in + `)`, append(append([]any{}, args...), args...)},
+		{&t.LinkBytes, `SELECT COALESCE(SUM(b.size), 0) FROM album_items ai JOIN albums a ON a.id = ai.album_id
+			JOIN items i ON i.id = ai.item_id JOIN blobs b ON b.id = i.blob_id WHERE a.account_id ` + in, args},
+	} {
+		if err := s.q.QueryRowContext(ctx, q.sql, q.args...).Scan(q.dst); err != nil {
+			return nil, err
+		}
+	}
+	rows, err := s.q.QueryContext(ctx, `SELECT ext, COUNT(*) FROM items WHERE account_id `+in+` GROUP BY ext`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ext string
+		var n int
+		if err := rows.Scan(&ext, &n); err != nil {
+			return nil, err
+		}
+		t.ByExt[ext] = n
+	}
+	return t, rows.Err()
 }
 
 // OccurrencesInFolder returns the occurrences of one folder of one export.
