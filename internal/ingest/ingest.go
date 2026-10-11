@@ -120,22 +120,30 @@ type Result struct {
 
 // Ingester holds the dependencies of ingest runs.
 type Ingester struct {
-	cfg   *config.Config
-	st    *store.Store
-	log   *slog.Logger
-	loc   *time.Location
-	rules takeout.Rules
+	cfg *config.Config
+	st  *store.Store
+	log *slog.Logger
+	loc *time.Location
 
 	journalCount atomic.Int64 // journal entries begun; used to decide whether a temp file may be removed
 }
 
 // New creates an Ingester.
 func New(cfg *config.Config, st *store.Store, log *slog.Logger) *Ingester {
-	rules := takeout.Rules{ProductFolders: cfg.Takeout.ProductFolders, YearPrefixes: cfg.Takeout.YearFolderPrefixes, ArchiveFolders: cfg.Takeout.ArchiveFolders, TrashFolders: cfg.Takeout.TrashFolders}
-	if len(rules.YearPrefixes) == 0 {
-		rules = takeout.DefaultRules
+	return &Ingester{cfg: cfg, st: st, log: log, loc: cfg.Location()}
+}
+
+// rulesFor returns the Takeout names of an account's Google language: each
+// account is classified with the names of its own language only, so an album
+// of one account cannot pass for a system folder of another language.
+func (ing *Ingester) rulesFor(account string) takeout.Rules {
+	rules, err := takeout.ForLanguage(ing.cfg.LanguageFor(account))
+	if err != nil {
+		// Validate refuses this; a config built by hand without it gets English
+		ing.log.Warn("takeout languages", "account", account, "err", err)
+		return takeout.DefaultRules
 	}
-	return &Ingester{cfg: cfg, st: st, log: log, loc: cfg.Location(), rules: rules}
+	return rules
 }
 
 type folderCtx struct {
@@ -219,16 +227,18 @@ type extracted struct {
 }
 
 type partRun struct {
-	ing     *Ingester
-	ctx     context.Context
-	src     Source
-	part    PartMeta
-	opt     Options
-	acct    *store.Account
-	arch    *store.Archive
-	folders map[string]*folderCtx
-	res     Result
-	tmpDir  string
+	rules      takeout.Rules // the account's Takeout names
+	recognized int           // entries under a known product folder
+	ing        *Ingester
+	ctx        context.Context
+	src        Source
+	part       PartMeta
+	opt        Options
+	acct       *store.Account
+	arch       *store.Archive
+	folders    map[string]*folderCtx
+	res        Result
+	tmpDir     string
 
 	prunedListing       string // newest complete listing applied to the account (lazy)
 	prunedListingLoaded bool
@@ -259,7 +269,7 @@ func (pr *partRun) appliedListing(album *store.Album) (string, error) {
 // finished entries are skipped and every file operation is idempotent.
 func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, opt Options) (*Result, error) {
 	start := time.Now()
-	pr := &partRun{ing: ing, ctx: ctx, src: src, part: part, opt: opt, folders: map[string]*folderCtx{}}
+	pr := &partRun{ing: ing, ctx: ctx, src: src, part: part, opt: opt, folders: map[string]*folderCtx{}, rules: ing.rulesFor(part.Account)}
 	pr.res.Part = part.Name
 	pr.tmpDir = path.Join(part.Account, ".tmp")
 
@@ -283,11 +293,14 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 	var badEntries []failedEntry // descriptor/sidecar entries that could not be read or parsed
 	var goodDescriptors []string // descriptor/sidecar entries parsed fine (to clear earlier failures)
 	for _, e := range src.Entries() {
-		ce, ok := takeout.Classify(e.Name, e.Size, ing.rules)
+		ce, ok := takeout.Classify(e.Name, e.Size, pr.rules)
 		if !ok {
 			continue
 		}
 		pr.res.Entries++
+		if ce.Folder != "" {
+			pr.recognized++ // under Takeout/<product>/<folder>/ (ignored top-level files aside)
+		}
 		switch ce.Type {
 		case takeout.TypeIgnore:
 			pr.res.Skipped++
@@ -331,7 +344,7 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 				pr.res.Skipped++
 				continue
 			}
-			if _, edited := takeout.IsEdited(ce.Base); edited && ing.cfg.Layout.EditedVersions == "prefer_original" {
+			if _, edited := pr.rules.IsEdited(ce.Base); edited && ing.cfg.Layout.EditedVersions == "prefer_original" {
 				pr.res.Skipped++
 				continue
 			}
@@ -341,6 +354,17 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 			mediaEntries = append(mediaEntries, job{e: e, ce: ce, fc: fc})
 			pr.res.Media++
 		}
+	}
+	// a part whose entries are all outside the layout this run understands is
+	// a configuration problem (a Takeout in another language names its folders
+	// differently), never an empty part: fail before recording anything, so
+	// the next run resumes from the local copy once the names are configured
+	if pr.recognized == 0 {
+		all := src.Entries()
+		if len(all) == 0 {
+			return nil, errors.New("the archive has no entries")
+		}
+		return nil, fmt.Errorf("none of the %d entries is under Takeout/<product>/<folder>/ with a known product folder (first entry %q): set this account's Google language in accounts.%s.takeout.language", len(all), all[0].Name, part.Account)
 	}
 	// year folders first (library items), then archive, then albums; by offset within each
 	rank := func(k takeout.FolderKind) int {
@@ -668,7 +692,7 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 			pr.res.SidecarsOrphaned = int(orphaned)
 		}
 	}
-	if err := ing.st.FinishArchive(ctx, arch.ID, status, pr.res.Media, counts[store.EntryDone], pr.res.Duplicates, pr.res.Failed+pr.res.GivenUp); err != nil {
+	if err := ing.st.FinishArchive(ctx, arch.ID, status, pr.res.Media, counts[store.EntryDone], pr.res.Duplicates, pr.res.Failed+pr.res.GivenUp, pr.recognized); err != nil {
 		return nil, err
 	}
 	// sidecars still waiting may now describe photos this part brought
@@ -685,7 +709,7 @@ func (ing *Ingester) IngestPart(ctx context.Context, src Source, part PartMeta, 
 func (pr *partRun) folder(ce takeout.Entry) *folderCtx {
 	fc, ok := pr.folders[ce.Folder]
 	if !ok {
-		fc = &folderCtx{name: ce.Folder, kind: ce.FolderKind, year: ce.Year, index: takeout.NewIndex()}
+		fc = &folderCtx{name: ce.Folder, kind: ce.FolderKind, year: ce.Year, index: takeout.NewIndex(pr.rules)}
 		pr.folders[ce.Folder] = fc
 	}
 	return fc
@@ -732,7 +756,7 @@ func (pr *partRun) resolveSidecar(j job) *takeout.Match {
 	if m, ok := j.fc.index.Lookup(j.ce.Base); ok {
 		return &m
 	}
-	for _, k := range takeout.LookupKeys(j.ce.Base) {
+	for _, k := range takeout.LookupKeys(j.ce.Base, pr.rules) {
 		p, err := pr.ing.st.GetPendingSidecar(pr.ctx, pr.acct.ID, pr.part.ExportID, j.fc.name, k.Key)
 		if err != nil || p == nil {
 			continue
@@ -753,7 +777,7 @@ func (pr *partRun) resolveSidecar(j job) *takeout.Match {
 				continue
 			}
 			var ok bool
-			if variant, still, ok = takeout.StemRole(j.ce.Base, cands); !ok {
+			if variant, still, ok = takeout.StemRole(j.ce.Base, cands, pr.rules); !ok {
 				continue
 			}
 		}
@@ -773,7 +797,7 @@ func (pr *partRun) resolveSidecar(j job) *takeout.Match {
 			sc.SourcePart = p.PartNo
 			n++
 			variant, still := takeout.VariantOriginal, j.ce.Base
-			if orig, edited := takeout.IsEdited(j.ce.Base); edited {
+			if orig, edited := pr.rules.IsEdited(j.ce.Base); edited {
 				variant, still = takeout.VariantEdited, orig
 			}
 			hit = &takeout.Match{Sidecar: sc, Variant: variant, Still: still, Key: key, Heuristic: true, Settled: pr.settled(j.fc.name, key, p)}
@@ -1795,6 +1819,7 @@ func (ing *Ingester) ResolvePending(ctx context.Context, acct *store.Account, ex
 }
 
 func (ing *Ingester) resolvePendingPass(ctx context.Context, acct *store.Account, exportID string, complete bool) (links, promoted int, err error) {
+	rules := ing.rulesFor(acct.Name)
 	rows, err := ing.st.PendingSidecarsOfExport(ctx, acct.ID, exportID)
 	if err != nil || len(rows) == 0 {
 		return 0, 0, err
@@ -1804,7 +1829,7 @@ func (ing *Ingester) resolvePendingPass(ctx context.Context, acct *store.Account
 		byFolder[r.Folder] = append(byFolder[r.Folder], r)
 	}
 	for folder, prs := range byFolder {
-		kind := takeout.ClassifyFolder(folder, ing.rules)
+		kind := takeout.ClassifyFolder(folder, rules)
 		occs, err := ing.st.OccurrencesInFolder(ctx, acct.ID, exportID, folder)
 		if err != nil {
 			return links, promoted, err
@@ -1879,7 +1904,7 @@ func (ing *Ingester) resolvePendingPass(ctx context.Context, acct *store.Account
 					// a deferred stem match is judged again against the media sharing
 					// the stem now: a second still arrived since makes it ambiguous, a
 					// still arrived since makes a deferred video the motion companion
-					variant, still, ok := takeout.StemRole(r.Entry, stemNames)
+					variant, still, ok := takeout.StemRole(r.Entry, stemNames, rules)
 					if !ok {
 						c.name = ""
 					} else {
@@ -1893,7 +1918,7 @@ func (ing *Ingester) resolvePendingPass(ctx context.Context, acct *store.Account
 			if len(stemNames) > 0 {
 				var stemCands []candidate
 				for _, name := range stemNames {
-					variant, still, ok := takeout.StemRole(name, stemNames)
+					variant, still, ok := takeout.StemRole(name, stemNames, rules)
 					if !ok {
 						stemCands = nil
 						break
@@ -1988,7 +2013,7 @@ func (ing *Ingester) resolvePendingPass(ctx context.Context, acct *store.Account
 				continue
 			}
 			variant := takeout.VariantOriginal
-			if _, edited := takeout.IsEdited(r.Key); edited {
+			if _, edited := rules.IsEdited(r.Key); edited {
 				variant = takeout.VariantEdited
 			}
 			item, err := ing.st.FindItemByKey(ctx, acct.ID, gid+"#"+variant)

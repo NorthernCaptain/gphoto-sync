@@ -85,6 +85,7 @@ type stemEntry struct {
 
 // Index maps the media files of one folder to their sidecars.
 type Index struct {
+	rules   Rules
 	exact   map[string]indexed // lower(media name) -> sidecar
 	byTitle map[string][]indexed
 	stems   []stemEntry
@@ -120,8 +121,8 @@ type indexed struct {
 }
 
 // NewIndex creates an empty index.
-func NewIndex() *Index {
-	return &Index{exact: map[string]indexed{}, byTitle: map[string][]indexed{}, used: map[*Sidecar]bool{}, media: map[string][]string{}}
+func NewIndex(r Rules) *Index {
+	return &Index{rules: r, exact: map[string]indexed{}, byTitle: map[string][]indexed{}, used: map[*Sidecar]bool{}, media: map[string][]string{}}
 }
 
 // Add registers a sidecar under the media names it describes.
@@ -152,12 +153,12 @@ func (ix *Index) Lookup(mediaBase string) (Match, bool) {
 		ix.used[e.sc] = true
 		// an edited file is the edited variant even with a sidecar of its own:
 		// that sidecar usually carries the original's Google id
-		if orig, edited := IsEdited(mediaBase); edited {
+		if orig, edited := ix.rules.IsEdited(mediaBase); edited {
 			return Match{Sidecar: e.sc, Variant: VariantEdited, Still: orig, Key: e.key}, true
 		}
 		return Match{Sidecar: e.sc, Variant: VariantOriginal, Still: mediaBase, Key: e.key}, true
 	}
-	if orig, edited := IsEdited(mediaBase); edited {
+	if orig, edited := ix.rules.IsEdited(mediaBase); edited {
 		if e, ok := ix.exact[strings.ToLower(orig)]; ok {
 			ix.used[e.sc] = true
 			return Match{Sidecar: e.sc, Variant: VariantEdited, Still: orig, Key: e.key}, true
@@ -167,7 +168,7 @@ func (ix *Index) Lookup(mediaBase string) (Match, bool) {
 	// for "11_16_12 - 1.jpg": Takeout appends the extension to the media only)
 	if root, ext := SplitExt(mediaBase); ext != "" {
 		if e, ok := ix.exact[strings.ToLower(root)]; ok && IsTitleKey(e.key) {
-			if variant, still, ok := StemRole(mediaBase, ix.StemCandidates(root)); ok {
+			if variant, still, ok := StemRole(mediaBase, ix.StemCandidates(root), ix.rules); ok {
 				ix.used[e.sc] = true
 				return Match{Sidecar: e.sc, Variant: variant, Still: still, Key: e.key, Heuristic: true}, true
 			}
@@ -211,12 +212,12 @@ func (ix *Index) Exact(mediaBase string) (Match, bool) {
 	lb := strings.ToLower(mediaBase)
 	if e, ok := ix.exact[lb]; ok {
 		ix.used[e.sc] = true
-		if orig, edited := IsEdited(mediaBase); edited {
+		if orig, edited := ix.rules.IsEdited(mediaBase); edited {
 			return Match{Sidecar: e.sc, Variant: VariantEdited, Still: orig, Key: e.key}, true
 		}
 		return Match{Sidecar: e.sc, Variant: VariantOriginal, Still: mediaBase, Key: e.key}, true
 	}
-	if orig, edited := IsEdited(mediaBase); edited {
+	if orig, edited := ix.rules.IsEdited(mediaBase); edited {
 		if e, ok := ix.exact[strings.ToLower(orig)]; ok {
 			ix.used[e.sc] = true
 			return Match{Sidecar: e.sc, Variant: VariantEdited, Still: orig, Key: e.key}, true
@@ -270,7 +271,7 @@ func (ix *Index) Unused() []struct {
 // LookupKeys returns the media keys under which a sidecar for mediaBase could
 // have been stored by an earlier part (for pending_sidecars lookups), each with
 // the variant it would imply.
-func LookupKeys(mediaBase string) []struct {
+func LookupKeys(mediaBase string, r Rules) []struct {
 	Key     string
 	Variant string
 	Still   string
@@ -280,7 +281,7 @@ func LookupKeys(mediaBase string) []struct {
 		Variant string
 		Still   string
 	}
-	orig, edited := IsEdited(mediaBase)
+	orig, edited := r.IsEdited(mediaBase)
 	own := VariantOriginal
 	if edited {
 		own = VariantEdited // an edited file with a sidecar of its own is still the edited variant
@@ -344,10 +345,10 @@ func isVideo(name string) bool {
 // original (or the edited variant); a still with one video are the original
 // and its motion companion, whichever the archive lists first; anything else
 // (two stills, two videos, three files) is ambiguous and not matched.
-func StemRole(mediaBase string, cands []string) (variant, still string, ok bool) {
+func StemRole(mediaBase string, cands []string, r Rules) (variant, still string, ok bool) {
 	switch len(cands) {
 	case 0, 1:
-		if orig, edited := IsEdited(mediaBase); edited {
+		if orig, edited := r.IsEdited(mediaBase); edited {
 			return VariantEdited, orig, true
 		}
 		return VariantOriginal, mediaBase, true

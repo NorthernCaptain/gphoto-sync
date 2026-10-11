@@ -23,6 +23,7 @@ type fakeRemote struct {
 	deleted  []string
 	listErr  map[string]error
 	files    map[string]string
+	copies   int // downloads served from files
 }
 
 func (f *fakeRemote) List(_ context.Context, remote string) ([]rclone.RemoteFile, error) {
@@ -40,6 +41,7 @@ func (f *fakeRemote) CopyID(_ context.Context, _, id, dest string) error {
 	if err != nil {
 		return err
 	}
+	f.copies++
 	return os.WriteFile(dest, data, 0o644)
 }
 func (f *fakeRemote) MoveID(context.Context, string, string, string) error { return nil }
@@ -86,7 +88,7 @@ func TestResumeSettlesStagedCopyFirst(t *testing.T) {
 	}
 	_ = st.SetArchiveStaged(ctx, a.ID)
 	// a later local ingest left the part partial with an error: the new copy resumes it
-	if err := st.FinishArchive(ctx, a.ID, store.ArchivePartial, 10, 9, 0, 1); err != nil {
+	if err := st.FinishArchive(ctx, a.ID, store.ArchivePartial, 10, 9, 0, 1, 20); err != nil {
 		t.Fatal(err)
 	}
 	ar := r.runAccount(ctx, "alice", false)
@@ -120,7 +122,7 @@ func TestFinishStagedDeletes(t *testing.T) {
 			t.Fatal(err)
 		}
 		// a later local ingest of the part failed one entry
-		if err := st.FinishArchive(ctx, a.ID, store.ArchiveWithErrors, 10, 9, 0, 1); err != nil {
+		if err := st.FinishArchive(ctx, a.ID, store.ArchiveWithErrors, 10, 9, 0, 1, 20); err != nil {
 			t.Fatal(err)
 		}
 		// an errored part never staged is in neither listing: nothing to touch
@@ -183,11 +185,15 @@ func TestDecide(t *testing.T) {
 		{"unknown part", nil, rclone.RemoteFile{ID: "x"}, false, dispNew},
 		{"given up entries, retry requested", &store.Archive{RemoteID: "x", MD5: "aa", Status: store.ArchiveWithErrors}, rclone.RemoteFile{ID: "x", Hashes: md5("aa")}, true, dispResume},
 		{"same file, partial", &store.Archive{RemoteID: "x", MD5: "aa", Status: store.ArchivePartial}, rclone.RemoteFile{ID: "x", Hashes: md5("aa")}, false, dispResume},
-		{"same file, ingested", &store.Archive{RemoteID: "x", MD5: "aa", Status: store.ArchiveIngested}, rclone.RemoteFile{ID: "x", Hashes: md5("aa")}, false, dispSkipIngested},
+		{"same file, ingested", &store.Archive{RemoteID: "x", MD5: "aa", Status: store.ArchiveIngested, Entries: 3}, rclone.RemoteFile{ID: "x", Hashes: md5("aa")}, false, dispSkipIngested},
+		{"same file, ingested with nothing recognized", &store.Archive{RemoteID: "x", MD5: "aa", Status: store.ArchiveIngested}, rclone.RemoteFile{ID: "x", Hashes: md5("aa")}, false, dispReplace},
+		{"same file, ingested, nothing recognized by count", &store.Archive{RemoteID: "x", MD5: "aa", Status: store.ArchiveIngested, Entries: 3, RecognizedKnown: true}, rclone.RemoteFile{ID: "x", Hashes: md5("aa")}, false, dispReplace},
+		{"same file, ingested, only skipped media", &store.Archive{RemoteID: "x", MD5: "aa", Status: store.ArchiveIngested, Recognized: 40, RecognizedKnown: true}, rclone.RemoteFile{ID: "x", Hashes: md5("aa")}, false, dispSkipIngested},
+		{"unprovable, ingested with nothing recognized", &store.Archive{Size: 5, Status: store.ArchiveIngested}, rclone.RemoteFile{ID: "y", Size: 5}, false, dispReplace},
 		{"same file, given up entries", &store.Archive{RemoteID: "x", MD5: "aa", Status: store.ArchiveWithErrors}, rclone.RemoteFile{ID: "x", Hashes: md5("aa")}, false, dispSkipErrors},
 		{"other md5", &store.Archive{RemoteID: "x", MD5: "aa", Status: store.ArchiveIngested}, rclone.RemoteFile{ID: "x", Hashes: md5("bb")}, false, dispReplace},
 		{"other size, partial", &store.Archive{RemoteID: "x", Size: 5, Status: store.ArchivePartial}, rclone.RemoteFile{ID: "y", Size: 6}, false, dispReplace},
-		{"unprovable, ingested", &store.Archive{Size: 5, Status: store.ArchiveIngested}, rclone.RemoteFile{ID: "y", Size: 5}, false, dispSkipUnverified},
+		{"unprovable, ingested", &store.Archive{Size: 5, Status: store.ArchiveIngested, Entries: 3}, rclone.RemoteFile{ID: "y", Size: 5}, false, dispSkipUnverified},
 		{"unprovable, partial", &store.Archive{Size: 5, Status: store.ArchivePartial}, rclone.RemoteFile{ID: "y", Size: 5}, false, dispReplace},
 		{"same id and size, no hash, partial", &store.Archive{RemoteID: "x", Size: 5, Status: store.ArchivePartial}, rclone.RemoteFile{ID: "x", Size: 5}, false, dispResume},
 	}

@@ -210,10 +210,23 @@ type Archive struct {
 	LocalPath       string
 	RemoteDeletedAt string // when the Drive copy was confirmed deleted ("" while still owed)
 	StagedAt        string // when the Drive copy was moved into the staging folder ("" if never)
-	Entries         int
+	Entries         int    // media entries seen
 	Ingested        int
 	Duplicates      int
 	Errors          int
+	Recognized      int  // entries under a known product folder
+	RecognizedKnown bool // false for a row written before Recognized was recorded
+}
+
+// NothingRecognized tells whether the ingest found no entry under a known
+// product folder (a Takeout in a language that was not configured at the
+// time): by the recorded count, or, for a row written before it was recorded,
+// by no media having been seen at all.
+func (a *Archive) NothingRecognized() bool {
+	if a.RecognizedKnown {
+		return a.Recognized == 0
+	}
+	return a.Entries == 0
 }
 
 // Archive statuses.
@@ -249,16 +262,17 @@ func (s *Store) UpsertArchive(ctx context.Context, a *Archive) (*Archive, error)
 	return s.GetArchive(ctx, a.AccountID, a.ExportID, a.PartNo)
 }
 
-const archiveCols = `id, account_id, remote_id, name, export_id, part_no, size, md5, status, local_path, remote_deleted_at, staged_at, entries, ingested, duplicates, errors`
+const archiveCols = `id, account_id, remote_id, name, export_id, part_no, size, md5, status, local_path, remote_deleted_at, staged_at, entries, ingested, duplicates, errors, recognized`
 
 func scanArchive(sc interface{ Scan(...any) error }) (*Archive, error) {
 	var a Archive
 	var remote, md5, local, deleted, staged sql.NullString
-	var size sql.NullInt64
-	if err := sc.Scan(&a.ID, &a.AccountID, &remote, &a.Name, &a.ExportID, &a.PartNo, &size, &md5, &a.Status, &local, &deleted, &staged, &a.Entries, &a.Ingested, &a.Duplicates, &a.Errors); err != nil {
+	var size, recognized sql.NullInt64
+	if err := sc.Scan(&a.ID, &a.AccountID, &remote, &a.Name, &a.ExportID, &a.PartNo, &size, &md5, &a.Status, &local, &deleted, &staged, &a.Entries, &a.Ingested, &a.Duplicates, &a.Errors, &recognized); err != nil {
 		return nil, err
 	}
 	a.RemoteID, a.MD5, a.LocalPath, a.Size, a.RemoteDeletedAt, a.StagedAt = remote.String, md5.String, local.String, size.Int64, deleted.String, staged.String
+	a.Recognized, a.RecognizedKnown = int(recognized.Int64), recognized.Valid
 	return &a, nil
 }
 
@@ -321,9 +335,9 @@ func (s *Store) ListArchives(ctx context.Context, accountID int64) ([]*Archive, 
 }
 
 // FinishArchive sets the final status and counters of a part.
-func (s *Store) FinishArchive(ctx context.Context, id int64, status string, entries, ingested, duplicates, errs int) error {
-	_, err := s.q.ExecContext(ctx, `UPDATE archives SET status = ?, entries = ?, ingested = ?, duplicates = ?, errors = ?, finished_at = ? WHERE id = ?`,
-		status, entries, ingested, duplicates, errs, Now(), id)
+func (s *Store) FinishArchive(ctx context.Context, id int64, status string, entries, ingested, duplicates, errs, recognized int) error {
+	_, err := s.q.ExecContext(ctx, `UPDATE archives SET status = ?, entries = ?, ingested = ?, duplicates = ?, errors = ?, recognized = ?, finished_at = ? WHERE id = ?`,
+		status, entries, ingested, duplicates, errs, recognized, Now(), id)
 	return err
 }
 

@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +14,9 @@ import (
 	"time"
 
 	"gphoto-sync/internal/config"
+	"gphoto-sync/internal/ingest"
 	"gphoto-sync/internal/rclone"
+	"gphoto-sync/internal/store"
 )
 
 const gp = "Takeout/Google Photos/"
@@ -144,5 +148,106 @@ func TestLibrarySummaryRendering(t *testing.T) {
 	}
 	if !strings.HasSuffix(html, "on disk\n") {
 		t.Errorf("summary is not the last block:\n%s", html)
+	}
+}
+
+// A part whose entries are all in another language's layout is refused and
+// kept in the inbox; once the names are configured, the next run ingests it
+// from the local copy without downloading it again.
+func TestUnrecognizedLayoutIsResumedFromLocalCopy(t *testing.T) {
+	rc := &fakeRemote{listings: map[string][]rclone.RemoteFile{}, files: map[string]string{}}
+	r, st := newRunner(t, rc)
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	r.Now = func() time.Time { return now }
+	ctx := context.Background()
+	const ru = "Takeout/Google Фото/"
+	zipPath := filepath.Join(t.TempDir(), "takeout-20261010T221633Z-1-001.zip")
+	writeZip(t, zipPath, map[string][]byte{
+		ru + "Фото 2023 г./a.jpg":                            bytes.Repeat([]byte("a"), 2048),
+		ru + "Фото 2023 г./a.jpg.supplemental-metadata.json": sidecar("a.jpg", "AAA", time.Date(2023, 1, 1, 13, 0, 0, 0, time.UTC)),
+	})
+	fi, err := os.Stat(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum, err := fileMD5(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.listings["gdrive:Takeout"] = []rclone.RemoteFile{{ID: "f1", Name: filepath.Base(zipPath), Size: fi.Size(), ModTime: now.Add(-30 * 24 * time.Hour), Hashes: map[string]string{"MD5": sum}}}
+	rc.files["f1"] = zipPath
+
+	rep := r.Run(ctx, []string{"alice"}, false)
+	if rep.Exit != ExitPartial || rc.copies != 1 || !strings.Contains(rep.Text(), "takeout.language") {
+		t.Fatalf("first run: exit %d, downloads %d:\n%s", rep.Exit, rc.copies, rep.Text())
+	}
+	local := filepath.Join(r.Cfg.Takeout.InboxDir, "alice", filepath.Base(zipPath))
+	if _, err := os.Stat(local); err != nil {
+		t.Fatalf("local copy not kept for the resume: %v", err)
+	}
+	if rep.Library != nil {
+		t.Fatalf("a refused part is not a change:\n%s", rep.Text())
+	}
+
+	r.Cfg.Accounts["alice"] = config.Account{RcloneRemote: "gdrive:Takeout", Takeout: config.TakeoutOverride{Language: "ru"}}
+	r.Ing = ingest.New(r.Cfg, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rep = r.Run(ctx, []string{"alice"}, false)
+	if rep.Exit != ExitOK || rc.copies != 1 {
+		t.Fatalf("second run: exit %d, downloads %d:\n%s", rep.Exit, rc.copies, rep.Text())
+	}
+	if len(rep.Library) != 1 || rep.Library[0].Photos != 1 {
+		t.Fatalf("second run library: %+v", rep.Library)
+	}
+	if _, err := os.Stat(local); !os.IsNotExist(err) {
+		t.Errorf("local copy still in the inbox after the ingest: %v", err)
+	}
+}
+
+// A part recorded as ingested without a single recognized entry (a Takeout in
+// a language that was not configured at the time, and the local copy already
+// removed) is fetched and ingested again once the language is configured.
+func TestZeroEntryIngestedPartIsFetchedAgain(t *testing.T) {
+	rc := &fakeRemote{listings: map[string][]rclone.RemoteFile{}, files: map[string]string{}}
+	r, st := newRunner(t, rc)
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	r.Now = func() time.Time { return now }
+	ctx := context.Background()
+	const ru = "Takeout/Google Фото/"
+	zipPath := filepath.Join(t.TempDir(), "takeout-20261010T221633Z-1-001.zip")
+	writeZip(t, zipPath, map[string][]byte{
+		ru + "Фото 2023 г./a.jpg":                            bytes.Repeat([]byte("a"), 2048),
+		ru + "Фото 2023 г./a.jpg.supplemental-metadata.json": sidecar("a.jpg", "AAA", time.Date(2023, 1, 1, 13, 0, 0, 0, time.UTC)),
+	})
+	fi, err := os.Stat(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum, err := fileMD5(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc.listings["gdrive:Takeout"] = []rclone.RemoteFile{{ID: "f1", Name: filepath.Base(zipPath), Size: fi.Size(), ModTime: now.Add(-30 * 24 * time.Hour), Hashes: map[string]string{"MD5": sum}}}
+	rc.files["f1"] = zipPath
+	acct, err := st.EnsureAccount(ctx, "alice", "gdrive:Takeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpsertArchive(ctx, &store.Archive{AccountID: acct.ID, RemoteID: "f1", Name: filepath.Base(zipPath), ExportID: "20261010T221633Z-1", PartNo: 1,
+		Size: fi.Size(), MD5: sum, Status: store.ArchiveIngested}); err != nil {
+		t.Fatal(err)
+	}
+
+	r.Cfg.Accounts["alice"] = config.Account{RcloneRemote: "gdrive:Takeout", Takeout: config.TakeoutOverride{Language: "ru"}}
+	r.Ing = ingest.New(r.Cfg, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rep := r.Run(ctx, []string{"alice"}, false)
+	if rep.Exit != ExitOK || rc.copies != 1 || len(rep.Library) != 1 || rep.Library[0].Photos != 1 {
+		t.Fatalf("exit %d, downloads %d, library %+v:\n%s", rep.Exit, rc.copies, rep.Library, rep.Text())
+	}
+	if !strings.Contains(rep.Text(), "without a single recognized entry") {
+		t.Errorf("report does not say why the part was ingested again:\n%s", rep.Text())
+	}
+	archs, _ := st.ListArchives(ctx, acct.ID)
+	if len(archs) != 1 || archs[0].Status != store.ArchiveIngested || archs[0].Entries == 0 {
+		t.Fatalf("archive after the run: %+v", archs)
 	}
 }

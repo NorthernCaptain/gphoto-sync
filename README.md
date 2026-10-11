@@ -26,7 +26,11 @@ timer. Design and decisions: [PLAN.md](PLAN.md).
    0600). The same client id serves every account. See PLAN.md 3.7 for the headless variants.
 2. **Takeout schedule per account** at takeout.google.com while signed in as that person:
    Google Photos only, monthly for one year, incremental after the first export,
-   destination **Add to Drive**, zip, 50 GB parts.
+   destination **Add to Drive**, zip, 50 GB parts. Takeout names its folders and files in
+   that person's Google language: set it per account as `takeout: { language: ru }`
+   (built in: `en`, the default, and `ru`). A part with no recognizable entry is refused
+   with a message saying so, and is ingested from the kept local copy once the language
+   is set.
 3. **Server layout** (see `deploy/systemd/gphoto-sync.service` for the mounts; `alice` stands
    for the user that owns the data, and `deploy/install-units.sh` rewrites the paths and the
    container uid/gid for whoever runs it with sudo):

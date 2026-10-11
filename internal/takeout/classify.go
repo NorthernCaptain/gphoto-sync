@@ -4,7 +4,9 @@
 package takeout
 
 import (
+	"fmt"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -41,28 +43,84 @@ type Entry struct {
 	Size       int64
 }
 
-// Rules configure classification.
+// Rules configure classification: the Takeout names of one language (Takeout
+// localizes its folder and file names to the account's Google language). An
+// empty list means the English default.
 type Rules struct {
 	ProductFolders []string // the product folder under Takeout/, e.g. "Google Photos"
-	YearPrefixes   []string
+	YearPrefixes   []string // what precedes the year in a year folder, e.g. "Photos from "
+	YearSuffixes   []string // what may follow it, e.g. "" or " г."
 	ArchiveFolders []string
 	TrashFolders   []string
+	AlbumMetaFiles []string // the album descriptor, e.g. "metadata.json"
+	EditedSuffixes []string // the edited-copy suffix before the extension, e.g. "-edited"
 }
 
 // DefaultRules are the English Takeout names.
 var DefaultRules = Rules{
 	ProductFolders: []string{"Google Photos"},
 	YearPrefixes:   []string{"Photos from "},
+	YearSuffixes:   []string{""},
 	ArchiveFolders: []string{"Archive"},
 	TrashFolders:   []string{"Trash"},
+	AlbumMetaFiles: []string{"metadata.json"},
+	EditedSuffixes: []string{"-edited"},
+}
+
+// Locales are the Takeout names per Google account language, each complete.
+var Locales = map[string]Rules{
+	"en": DefaultRules,
+	"ru": { // seen in a 2026-10 export of a Russian-language account
+		ProductFolders: []string{"Google Фото"},
+		YearPrefixes:   []string{"Фото "},
+		YearSuffixes:   []string{" г."},
+		ArchiveFolders: []string{"Отправить в архив"},
+		TrashFolders:   []string{"Корзина"},
+		AlbumMetaFiles: []string{"метаданные.json"},
+		EditedSuffixes: []string{"-отредактировано"},
+	},
+}
+
+// KnownLanguages lists the languages with built-in names, sorted.
+func KnownLanguages() []string {
+	out := make([]string, 0, len(Locales))
+	for l := range Locales {
+		out = append(out, l)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ForLanguage returns the names of one language. An account is classified
+// with the names of its own language only: merging languages would let an
+// album of one language pass for a system folder of another.
+func ForLanguage(lang string) (Rules, error) {
+	loc, ok := Locales[lang]
+	if !ok {
+		return Rules{}, fmt.Errorf("takeout language %q is not built in (known: %s)", lang, strings.Join(KnownLanguages(), ", "))
+	}
+	return loc, nil
+}
+
+// pick returns list, or def when list is empty.
+func pick(list, def []string) []string {
+	if len(list) == 0 {
+		return def
+	}
+	return list
 }
 
 func (r Rules) isProduct(name string) bool {
-	folders := r.ProductFolders
-	if len(folders) == 0 {
-		folders = DefaultRules.ProductFolders
+	for _, p := range pick(r.ProductFolders, DefaultRules.ProductFolders) {
+		if name == p {
+			return true
+		}
 	}
-	for _, p := range folders {
+	return false
+}
+
+func (r Rules) isAlbumMeta(name string) bool {
+	for _, p := range pick(r.AlbumMetaFiles, DefaultRules.AlbumMetaFiles) {
 		if name == p {
 			return true
 		}
@@ -97,7 +155,7 @@ func Classify(name string, size int64, r Rules) (e Entry, ok bool) {
 	switch {
 	case ignoredFiles[e.Base]:
 		e.Type = TypeIgnore
-	case e.Base == "metadata.json":
+	case r.isAlbumMeta(e.Base):
 		if e.FolderKind == FolderAlbum {
 			e.Type = TypeAlbumMeta
 		} else {
@@ -118,19 +176,25 @@ func ClassifyFolder(folder string, r Rules) FolderKind {
 }
 
 func classifyFolder(folder string, r Rules) (FolderKind, int) {
-	for _, p := range r.YearPrefixes {
-		if strings.HasPrefix(folder, p) {
-			if y, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(folder, p))); err == nil && y > 1800 && y < 3000 {
-				return FolderYear, y
+	for _, p := range pick(r.YearPrefixes, DefaultRules.YearPrefixes) {
+		rest, ok := strings.CutPrefix(folder, p)
+		if !ok {
+			continue
+		}
+		for _, suffix := range pick(r.YearSuffixes, DefaultRules.YearSuffixes) {
+			if y, ok := strings.CutSuffix(rest, suffix); ok {
+				if n, err := strconv.Atoi(strings.TrimSpace(y)); err == nil && n > 1800 && n < 3000 {
+					return FolderYear, n
+				}
 			}
 		}
 	}
-	for _, a := range r.ArchiveFolders {
+	for _, a := range pick(r.ArchiveFolders, DefaultRules.ArchiveFolders) {
 		if folder == a {
 			return FolderArchive, 0
 		}
 	}
-	for _, t := range r.TrashFolders {
+	for _, t := range pick(r.TrashFolders, DefaultRules.TrashFolders) {
 		if folder == t {
 			return FolderTrash, 0
 		}
@@ -148,17 +212,18 @@ func SplitExt(name string) (root, ext string) {
 	return name[:i], name[i:]
 }
 
-// IsEdited reports whether a media name is a Google "-edited" version and
-// returns the original's name.
-func IsEdited(base string) (orig string, edited bool) {
+// IsEdited reports whether a media name is a Google "-edited" version (in
+// any configured language) and returns the original's name.
+func (r Rules) IsEdited(base string) (orig string, edited bool) {
 	root, ext := SplitExt(base)
-	const suffix = "-edited"
-	if strings.HasSuffix(root, suffix) {
-		return strings.TrimSuffix(root, suffix) + ext, true
-	}
-	// "IMG_1-edited(1).jpg": the (n) can follow -edited
-	if i := strings.LastIndex(root, suffix+"("); i >= 0 && strings.HasSuffix(root, ")") {
-		return root[:i] + root[i+len(suffix):] + ext, true
+	for _, suffix := range pick(r.EditedSuffixes, DefaultRules.EditedSuffixes) {
+		if strings.HasSuffix(root, suffix) {
+			return strings.TrimSuffix(root, suffix) + ext, true
+		}
+		// "IMG_1-edited(1).jpg": the (n) can follow -edited
+		if i := strings.LastIndex(root, suffix+"("); i >= 0 && strings.HasSuffix(root, ")") {
+			return root[:i] + root[i+len(suffix):] + ext, true
+		}
 	}
 	return base, false
 }

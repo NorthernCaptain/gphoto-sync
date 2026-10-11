@@ -2494,3 +2494,67 @@ func TestTitleEntryWithUnrelatedPairMakesNoVariant(t *testing.T) {
 	}
 	f.mustExist("alice/albums/Trip to Austin/B.jpg")
 }
+
+// A Takeout made by a Russian-language account: with the English names only
+// the part is refused as a configuration error and nothing is recorded; with
+// the names configured, year folders, albums, the edited copy and Trash are
+// all recognized.
+func TestLocalizedTakeoutNames(t *testing.T) {
+	const ru = "Takeout/Google Фото/"
+	f := newFixture(t)
+	part := f.zip("takeout-20261010T221633Z-1-001.zip", []file{
+		{ru + "Фото 2023 г./20230101_1.jpg", randBytes(90)},
+		{ru + "Фото 2023 г./20230101_1.jpg.supplemental-metadata.json", sidecar("20230101_1.jpg", "AAA", tJuly, "")},
+		{ru + "Фото 2023 г./20230101_1-отредактировано.jpg", randBytes(91)},
+		{ru + "Рим/20230101_2.jpg", randBytes(92)},
+		{ru + "Рим/20230101_2.jpg.supplemental-metadata.json", sidecar("20230101_2.jpg", "BBB", tJuly, "")},
+		{ru + "Рим/метаданные.json", []byte(`{"title":"Рим","description":"","access":"protected","date":{"timestamp":"1657473817","formatted":"x"}}`)},
+		{ru + "Корзина/20230101_3.jpg", randBytes(93)},
+		{ru + "Корзина/20230101_3.jpg.supplemental-metadata.json", sidecar("20230101_3.jpg", "TTT", tJuly, "")},
+		{"Takeout/archive_browser.html", []byte("<html>")},
+	})
+	src, err := OpenZip(part)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.ing.IngestPart(f.ctx, src, PartMeta{Account: "alice", ExportID: "20261010T221633Z-1", PartNo: 1, Name: filepath.Base(part)}, Options{})
+	src.Close()
+	if err == nil || !strings.Contains(err.Error(), "takeout.language") {
+		t.Fatalf("English rules: want a configuration error, got %v", err)
+	}
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
+	if archs, _ := f.st.ListArchives(f.ctx, acct.ID); len(archs) > 0 && archs[0].Status == store.ArchiveIngested {
+		t.Fatalf("refused part recorded as ingested: %+v", archs[0])
+	}
+	if c, _ := f.st.Counts(f.ctx, acct.ID); c["items"] != 0 {
+		t.Fatalf("refused part created items: %v", c)
+	}
+
+	f.cfg.Accounts["alice"] = config.Account{Takeout: config.TakeoutOverride{Language: "ru"}}
+	r := f.ingest("alice", part, Options{})
+	if r.Added != 3 || r.Links != 1 {
+		t.Fatalf("configured rules: added %d, links %d: %+v", r.Added, r.Links, r)
+	}
+	f.mustExist("alice/library/2022/07/20230101_1.jpg", "alice/library/2022/07/20230101_2.jpg", "alice/albums/Рим/20230101_2.jpg")
+	if f.exists("alice/library/2022/07/20230101_3.jpg") || f.exists("alice/albums/Корзина") {
+		t.Error("Trash was ingested")
+	}
+	if it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#edited"); it == nil {
+		t.Error("the localized edited copy was not recognized as the edited variant")
+	}
+	albums, _ := f.st.ListAlbums(f.ctx, acct.ID)
+	if len(albums) != 1 || albums[0].Title != "Рим" {
+		t.Errorf("albums: %+v", albums)
+	}
+
+	// an English-language account is classified with the English names only:
+	// its album named like the Russian Trash folder is an album
+	jane := f.zip("takeout-20261010T221633Z-2-001.zip", []file{
+		{gp + "Корзина/x.jpg", randBytes(94)},
+		{gp + "Корзина/x.jpg.supplemental-metadata.json", sidecar("x.jpg", "XXX", tJuly, "")},
+	})
+	if r := f.ingest("jane", jane, Options{}); r.Added != 1 || r.Links != 1 {
+		t.Fatalf("English account: added %d, links %d", r.Added, r.Links)
+	}
+	f.mustExist("jane/albums/Корзина/x.jpg")
+}

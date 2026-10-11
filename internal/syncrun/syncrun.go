@@ -676,6 +676,10 @@ func decide(arch *store.Archive, f rclone.RemoteFile, awaitingRetry bool) (dispo
 	switch {
 	case why != "":
 		return dispReplace, why
+	case arch.Status == store.ArchiveIngested && arch.NothingRecognized():
+		// nothing in it was recognized (a Takeout in a language that was not
+		// configured at the time): not an ingest, whatever the row says
+		return dispReplace, "recorded as ingested without a single recognized entry"
 	case !verified && arch.Status == store.ArchiveIngested:
 		return dispSkipUnverified, ""
 	case !verified:

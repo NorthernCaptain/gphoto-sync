@@ -40,6 +40,65 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+// A Takeout made by an account in another language names the product folder,
+// the year folders, the album descriptor, Archive, Trash and the edited copies
+// in that language; the names of that language alone classify it.
+func TestClassifyLocalized(t *testing.T) {
+	ru, err := ForLanguage("ru")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ForLanguage("xx"); err == nil {
+		t.Error("an unknown language was accepted")
+	}
+	cases := []struct {
+		name string
+		kind FolderKind
+		typ  EntryType
+		year int
+		ok   bool
+	}{
+		{"Takeout/Google Фото/Фото 2023 г./20230101_1.jpg", FolderYear, TypeMedia, 2023, true},
+		{"Takeout/Google Фото/Фото 2023 г./20230101_1.jpg.supplemental-metadata.json", FolderYear, TypeSidecar, 2023, true},
+		{"Takeout/Google Photos/Photos from 2003/l-05.jpg", 0, 0, 0, false}, // another language's product folder
+		{"Takeout/Google Фото/Фото 2023 г. поездка/x.jpg", FolderAlbum, TypeMedia, 0, true},
+		{"Takeout/Google Фото/Фото 2023/x.jpg", FolderAlbum, TypeMedia, 0, true}, // the Russian year folder carries its suffix
+		{"Takeout/Google Фото/Рим/метаданные.json", FolderAlbum, TypeAlbumMeta, 0, true},
+		{"Takeout/Google Фото/Фото 2023 г./метаданные.json", FolderYear, TypeIgnore, 2023, true},
+		{"Takeout/Google Фото/Отправить в архив/x.jpg", FolderArchive, TypeMedia, 0, true},
+		{"Takeout/Google Фото/Корзина/x.jpg", FolderTrash, TypeMedia, 0, true},
+		{"Takeout/Google Фото/Trash/x.jpg", FolderAlbum, TypeMedia, 0, true}, // an English name is an album here
+	}
+	for _, c := range cases {
+		e, ok := Classify(c.name, 1, ru)
+		if ok != c.ok {
+			t.Errorf("%s: ok=%v want %v", c.name, ok, c.ok)
+			continue
+		}
+		if ok && (e.FolderKind != c.kind || e.Type != c.typ || e.Year != c.year) {
+			t.Errorf("%s: got kind=%v type=%v year=%d", c.name, e.FolderKind, e.Type, e.Year)
+		}
+	}
+	// the English rules alone do not recognize the Russian layout at all
+	if _, ok := Classify("Takeout/Google Фото/Фото 2023 г./x.jpg", 1, DefaultRules); ok {
+		t.Error("English rules accepted a Russian product folder")
+	}
+	if o, e := ru.IsEdited("IMG_1-отредактировано.jpg"); !e || o != "IMG_1.jpg" {
+		t.Errorf("localized edited suffix: %q %v", o, e)
+	}
+	if _, e := ru.IsEdited("IMG_1-edited(1).jpg"); e {
+		t.Error("Russian rules recognized the English edited suffix")
+	}
+	if _, e := DefaultRules.IsEdited("IMG_1-отредактировано.jpg"); e {
+		t.Error("default rules recognized a Russian edited suffix")
+	}
+	// the English names classify an English account's album named like a
+	// Russian system folder as an album
+	if e, ok := Classify("Takeout/Google Photos/Корзина/x.jpg", 1, DefaultRules); !ok || e.FolderKind != FolderAlbum {
+		t.Errorf("English account, album Корзина: %+v %v", e, ok)
+	}
+}
+
 func TestSidecarKeys(t *testing.T) {
 	cases := map[string][]string{
 		"IMG_1.jpg.supplemental-metadata.json":                     {"IMG_1.jpg"},
@@ -65,7 +124,7 @@ func sc(title, url string) *Sidecar {
 }
 
 func TestIndexLookup(t *testing.T) {
-	ix := NewIndex()
+	ix := NewIndex(DefaultRules)
 	ix.Add("IMG_1.jpg.supplemental-metadata.json", sc("IMG_1.jpg", "https://photos.google.com/photo/AAA"))
 	ix.Add("IMG_1.jpg.supplemental-metadata(1).json", sc("IMG_1.jpg", "https://photos.google.com/photo/BBB"))
 	ix.Add("PXL_1.MP.jpg.supplemental-metadata.json", sc("PXL_1.MP.jpg", "https://photos.google.com/photo/CCC"))
@@ -100,16 +159,16 @@ func TestIndexLookup(t *testing.T) {
 }
 
 func TestLookupKeys(t *testing.T) {
-	keys := LookupKeys("IMG_1-edited.jpg")
+	keys := LookupKeys("IMG_1-edited.jpg", DefaultRules)
 	if len(keys) < 2 || keys[0].Key != "IMG_1-edited.jpg" || keys[0].Variant != VariantEdited || keys[1].Key != "IMG_1.jpg" || keys[1].Variant != VariantEdited {
 		t.Errorf("edited lookup keys: %+v", keys)
 	}
-	keys = LookupKeys("PXL_1.MP")
+	keys = LookupKeys("PXL_1.MP", DefaultRules)
 	if keys[0].Variant != VariantOriginal || len(keys) < 2 || keys[1].Variant != VariantMotion {
 		t.Errorf("motion lookup keys: %+v", keys)
 	}
 	// a sidecar named after a title without extension is the last candidate
-	keys = LookupKeys("11_16_12 - 1.jpg")
+	keys = LookupKeys("11_16_12 - 1.jpg", DefaultRules)
 	if last := keys[len(keys)-1]; last.Key != "11_16_12 - 1" || last.Variant != VariantOriginal {
 		t.Errorf("stem lookup key: %+v", keys)
 	}
@@ -134,13 +193,13 @@ func TestParseAlbumMeta(t *testing.T) {
 }
 
 func TestIsEdited(t *testing.T) {
-	if o, e := IsEdited("IMG_1-edited.jpg"); !e || o != "IMG_1.jpg" {
+	if o, e := DefaultRules.IsEdited("IMG_1-edited.jpg"); !e || o != "IMG_1.jpg" {
 		t.Errorf("got %s %v", o, e)
 	}
-	if o, e := IsEdited("IMG_1-edited(1).jpg"); !e || o != "IMG_1(1).jpg" {
+	if o, e := DefaultRules.IsEdited("IMG_1-edited(1).jpg"); !e || o != "IMG_1(1).jpg" {
 		t.Errorf("got %s %v", o, e)
 	}
-	if _, e := IsEdited("IMG_1.jpg"); e {
+	if _, e := DefaultRules.IsEdited("IMG_1.jpg"); e {
 		t.Error("false positive")
 	}
 }

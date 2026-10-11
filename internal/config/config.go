@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"gphoto-sync/internal/takeout"
 )
 
 // Config is the whole configuration file. Every duration is a Go duration string.
@@ -44,7 +46,8 @@ type Account struct {
 
 // TakeoutOverride holds the per-account overrides of Takeout settings.
 type TakeoutOverride struct {
-	Settle *time.Duration `yaml:"settle"`
+	Settle   *time.Duration `yaml:"settle"`
+	Language string         `yaml:"language"` // Google language of this account's Takeout; "en" when empty
 }
 
 // Layout controls where files are placed and how they are named.
@@ -70,10 +73,6 @@ type Takeout struct {
 	IncludeArchive          bool          `yaml:"include_archive"`
 	MaxEntryAttempts        int           `yaml:"max_entry_attempts"`
 	ExportCompleteAfter     time.Duration `yaml:"export_complete_after"`
-	ProductFolders          []string      `yaml:"product_folders"`
-	YearFolderPrefixes      []string      `yaml:"year_folder_prefixes"`
-	ArchiveFolders          []string      `yaml:"archive_folders"`
-	TrashFolders            []string      `yaml:"trash_folders"`
 }
 
 // Telegram controls the notification bot.
@@ -118,10 +117,6 @@ func Default() *Config {
 			IncludeArchive:      true,
 			MaxEntryAttempts:    3,
 			ExportCompleteAfter: 168 * time.Hour,
-			ProductFolders:      []string{"Google Photos"},
-			YearFolderPrefixes:  []string{"Photos from "},
-			ArchiveFolders:      []string{"Archive"},
-			TrashFolders:        []string{"Trash"},
 		},
 		Telegram: Telegram{
 			BotTokenFile:       "/config/telegram.token",
@@ -216,6 +211,9 @@ func (c *Config) Validate() error {
 		if name == "" || name != filepath.Base(name) || strings.ContainsAny(name, " /\\") || strings.HasPrefix(name, ".") {
 			errs = append(errs, fmt.Errorf("account name %q must be a plain folder name", name))
 		}
+		if _, err := takeout.ForLanguage(c.LanguageFor(name)); err != nil {
+			errs = append(errs, fmt.Errorf("accounts.%s.takeout.language: %w", name, err))
+		}
 		_ = a
 	}
 	if c.Timezone != "" {
@@ -264,4 +262,13 @@ func (c *Config) SettleFor(account string) time.Duration {
 		return *a.Takeout.Settle
 	}
 	return c.Takeout.Settle
+}
+
+// LanguageFor returns the Google language of an account's Takeout: the names
+// of its folders and files come in it. English when not configured.
+func (c *Config) LanguageFor(account string) string {
+	if a, ok := c.Accounts[account]; ok && a.Takeout.Language != "" {
+		return a.Takeout.Language
+	}
+	return "en"
 }

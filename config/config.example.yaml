@@ -14,7 +14,8 @@ accounts:                  # key = e-mail local part = folder name under data_di
     rclone_remote: "gdrive-alice:Takeout"
   # jane:
   #   rclone_remote: "gdrive-jane:Takeout"
-  #   takeout: { settle: 4h }
+  #   takeout: { settle: 4h, language: ru }      # Takeout names its folders and files in the
+  #                                              # account's Google language; built in: en (default), ru
 
 layout:
   library: "{year}/{month}"          # under data_dir/<account>/library (the only supported layout)
@@ -36,7 +37,6 @@ takeout:
   include_archive: true              # Google's Archive/ folder: ingested, flagged archived
   max_entry_attempts: 3              # runs before a failing entry is given up
   export_complete_after: 168h        # no new part for 7 days -> report asks to confirm the part count
-  product_folders: ["Google Photos"] # Takeout/<product>/ folders that belong to Photos (localized names go here)
 
 telegram:
   enabled: false

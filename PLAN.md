@@ -52,6 +52,19 @@ one official path that delivers originals: **Google Takeout → Google Drive →
 - **Known quirks** an ingester must handle, verified on 2026-10-06 against part 1 of the
   real export (33,096 entries, 13,352 media, 19,744 sidecars, 26 year folders, 112 album
   folders, all entries deflate-compressed, 314 non-ASCII names):
+  - **everything Google names is localized** to the account's language: the product folder
+    (`Google Фото`), the year folders (`Фото 2023 г.`: prefix *and* suffix), the album
+    descriptor (`метаданные.json`), the Archive and Trash folders (`Отправить в архив`,
+    `Корзина`) and the edited-copy suffix (`-отредактировано`), seen in the 2026-10-10 export
+    of a Russian-language account. Only the sidecar suffix `.supplemental-metadata.json` and
+    `archive_browser.html` stay English. The names come as a whole per language, built in for
+    en and ru, and are chosen per account (`accounts.<name>.takeout.language`): an account
+    is classified with its own language's names only, so an album of an English account
+    named `Корзина` stays an album. A part in which no entry matches a known product folder
+    is refused as a configuration error with the local copy kept, so the next run resumes
+    without downloading it again; a part recorded as ingested without a single recognized
+    entry (`archives.recognized`, or no media seen for rows older than that column) is
+    ingested again from scratch.
   - album folders do **not** always hold the media: for many members Takeout writes only
     the sidecar JSON into the album folder while the file itself sits in its year folder
     (844 of 43,591 items in the 2026-10-07 export). Such a sidecar-only entry is an album
@@ -600,7 +613,8 @@ accounts:                  # key = e-mail local part = folder name under data_di
     rclone_remote: "gdrive-alice:Takeout"
   jane:                                # example for the second account
     rclone_remote: "gdrive-jane:Takeout"
-    takeout: { settle: 4h }            # optional override of takeout.* for this account
+    takeout: { settle: 4h, language: ru }   # per-account: settle, and the Google language the
+                                       # Takeout is named in (built in: en, the default, and ru)
 layout:
   library: "{year}/{month}"          # under data_dir/<account>/library
   albums: "albums"                   # own and shared albums alike
