@@ -1290,6 +1290,19 @@ func (s *Store) GetPendingSidecar(ctx context.Context, accountID int64, exportID
 // of the same export, or (for a key without extension, a sidecar named after
 // a title) a name whose stem is the key. Occurrences waiting for or dropped
 // by a replacement do not count.
+// pendingDeferredNamelessSQL finds a row (alias p) whose deferred entry is
+// still a nameless item: however the row was settled (a name collision
+// decided as an album entry of the photo delivered elsewhere), the file under
+// that name never got the identity the sidecar names, and the resolver judges
+// it again with the current rules. The judgement is idempotent for a file
+// that is truly unrelated to the photo.
+const pendingDeferredNamelessSQL = `SELECT 1 FROM occurrences o JOIN items i ON i.id = o.item_id
+	 WHERE p.deferred_entry IS NOT NULL
+	   AND o.account_id = p.account_id AND o.export_id = p.export_id
+	   AND o.folder = p.folder AND o.state NOT IN ('reset', 'removed')
+	   AND o.entry_name = p.deferred_entry COLLATE NOCASE
+	   AND i.identity_src = 'fallback'`
+
 const pendingFoundSQL = `SELECT 1 WHERE p.resolved = 1 OR EXISTS (
 	SELECT 1 FROM occurrences o JOIN items i ON i.id = o.item_id
 	 WHERE o.account_id = p.account_id AND o.export_id = p.export_id
@@ -1398,7 +1411,7 @@ type PendingRow struct {
 func (s *Store) PendingSidecarsOfExport(ctx context.Context, accountID int64, exportID string) ([]PendingRow, error) {
 	rows, err := s.q.QueryContext(ctx, `SELECT p.folder, p.media_key, p.json, p.part_no, p.deferred_entry, p.deferred_variant, p.deferred_still
 		FROM pending_sidecars p WHERE p.account_id = ? AND p.export_id = ?
-		AND NOT EXISTS (`+pendingFoundSQL+`)
+		AND (NOT EXISTS (`+pendingFoundSQL+`) OR EXISTS (`+pendingDeferredNamelessSQL+`))
 		ORDER BY p.folder, p.media_key`, accountID, exportID)
 	if err != nil {
 		return nil, err

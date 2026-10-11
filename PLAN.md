@@ -68,8 +68,10 @@ one official path that delivers originals: **Google Takeout → Google Drive →
   - a motion photo may come as `X.jpg` + `X.MP4` (Samsung) with one sidecar, the three spread
     over parts in any order. Whichever file is committed first takes the Google id; when the
     other arrives, the known item delivered beside it under a name sharing the stem is its
-    companion, not a name collision (100 stills of the 2026-10-11 export were deferred as
-    collisions before this rule; the resolver re-judges deferred rows and promoted them).
+    companion, not a name collision. A settled row whose deferred entry is still a nameless
+    item is judged again by the resolver on every run (idempotent for a truly unrelated
+    file): 100 stills of the 2026-10-11 export, settled as "the photo was delivered
+    elsewhere" because their clip held the id, were promoted that way.
   - album folders do **not** always hold the media: for many members Takeout writes only
     the sidecar JSON into the album folder while the file itself sits in its year folder
     (844 of 43,591 items in the 2026-10-07 export). Such a sidecar-only entry is an album

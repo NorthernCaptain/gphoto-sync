@@ -2613,11 +2613,15 @@ func TestDeferredStillOfMotionPairPromoted(t *testing.T) {
 	if c, _ := f.st.Counts(f.ctx, acct.ID); c["items_fallback"] != 1 {
 		t.Fatalf("setup: counts %v", c)
 	}
-	// the row as the earlier rule left it: stored, deferred to the still, unresolved
+	// the row as the earlier rule left it: stored, deferred to the still, and
+	// settled as an album entry of "the photo delivered elsewhere" (the video)
 	if err := f.st.PutPendingSidecar(f.ctx, acct.ID, export, 1, folder, key, raw, "GID1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.st.DeferPendingSidecar(f.ctx, acct.ID, export, folder, key, key, takeout.VariantOriginal, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.MarkPendingResolved(f.ctx, acct.ID, export, folder, key); err != nil {
 		t.Fatal(err)
 	}
 	links, promoted, err := f.ing.ResolvePending(f.ctx, acct, export, false)
@@ -2632,4 +2636,44 @@ func TestDeferredStillOfMotionPairPromoted(t *testing.T) {
 	if c, _ := f.st.Counts(f.ctx, acct.ID); c["items_fallback"] != 0 || c["pending_sidecars"] != 0 {
 		t.Errorf("counts %v", c)
 	}
+}
+
+// A file merely sharing the name of a photo delivered elsewhere stays a
+// nameless album entry: the resolver judges its settled row again on every
+// run and comes to the same decision, without touching it.
+func TestResolvedCollisionRowStaysResolved(t *testing.T) {
+	f := newFixture(t)
+	const export, year, key = "20261010T221633Z-1", "Photos from 2023", "X.jpg"
+	raw := sidecar(key, "GIDX", tJuly, "")
+	f.ingest("alice", f.zip("takeout-20261010T221633Z-1-001.zip", []file{
+		{gp + "Trip/" + key, randBytes(60)},
+		{gp + "Trip/" + key + ".supplemental-metadata.json", raw},
+	}), Options{})
+	f.ingest("alice", f.zip("takeout-20261010T221633Z-1-002.zip", []file{{gp + year + "/" + key + ".supplemental-metadata.json", raw}}), Options{})
+	f.ingest("alice", f.zip("takeout-20261010T221633Z-1-003.zip", []file{{gp + year + "/" + key, randBytes(61)}}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
+	check := func(when string) {
+		t.Helper()
+		if c, _ := f.st.Counts(f.ctx, acct.ID); c["items_fallback"] != 1 || c["items"] != 2 {
+			t.Fatalf("%s: counts %v", when, c)
+		}
+		p, _ := f.st.GetPendingSidecar(f.ctx, acct.ID, export, year, key)
+		if p == nil || !p.Resolved {
+			t.Fatalf("%s: row %+v", when, p)
+		}
+		// settled, yet listed for the resolver because its file is nameless
+		if rows, _ := f.st.PendingSidecarsOfExport(f.ctx, acct.ID, export); len(rows) != 1 || rows[0].Entry != key {
+			t.Fatalf("%s: rows %+v", when, rows)
+		}
+	}
+	// the sidecar of the year folder is deferred to the nameless file and
+	// settled: the photo was delivered in the album folder
+	if _, promoted, err := f.ing.ResolvePending(f.ctx, acct, export, false); err != nil || promoted != 0 {
+		t.Fatalf("first resolve: promoted %d, err %v", promoted, err)
+	}
+	check("after the first resolve")
+	if _, promoted, err := f.ing.ResolvePending(f.ctx, acct, export, false); err != nil || promoted != 0 {
+		t.Fatalf("second resolve: promoted %d, err %v", promoted, err)
+	}
+	check("after the second resolve")
 }
