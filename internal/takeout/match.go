@@ -226,6 +226,15 @@ func (ix *Index) Exact(mediaBase string) (Match, bool) {
 	return Match{}, false
 }
 
+// SameStem tells whether two media names belong to one motion photo: the same
+// name with different extensions (X.jpg, X.MP4), or one being the other
+// without its extension (PXL_1.MP.jpg, PXL_1.MP).
+func SameStem(a, b string) bool {
+	ra, _ := SplitExt(a)
+	rb, _ := SplitExt(b)
+	return strings.EqualFold(ra, rb) || strings.EqualFold(ra, b) || strings.EqualFold(rb, a)
+}
+
 // CompanionStills lists the still-image names a companion file could belong to.
 func CompanionStills(mediaBase string) []string {
 	root, ext := SplitExt(mediaBase)

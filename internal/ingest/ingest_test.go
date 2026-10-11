@@ -2558,3 +2558,78 @@ func TestLocalizedTakeoutNames(t *testing.T) {
 	}
 	f.mustExist("jane/albums/Корзина/x.jpg")
 }
+
+// A motion photo delivered as X.jpg plus X.MP4 (Samsung) whose sidecar came
+// in an earlier part than the files, the video in an earlier part than the
+// still: the video takes the Google id as the motion companion, and the
+// still's sidecar then names an id already held by other bytes. The video is
+// its companion, not a collision, whichever of the two arrives first.
+func TestMotionPairStillAfterVideo(t *testing.T) {
+	for _, order := range []string{"video first", "still first"} {
+		t.Run(order, func(t *testing.T) {
+			f := newFixture(t)
+			const dir = gp + "Photos from 2023/"
+			f.ingest("alice", f.zip("takeout-20261010T221633Z-1-001.zip", []file{
+				{dir + "20230621_145830.jpg.supplemental-metadata.json", sidecar("20230621_145830.jpg", "GID1", tJuly, "")},
+			}), Options{})
+			video := file{dir + "20230621_145830.MP4", randBytes(70)}
+			still := file{dir + "20230621_145830.jpg", randBytes(71)}
+			second, third := video, still
+			if order == "still first" {
+				second, third = still, video
+			}
+			f.ingest("alice", f.zip("takeout-20261010T221633Z-1-002.zip", []file{second}), Options{})
+			r := f.ingest("alice", f.zip("takeout-20261010T221633Z-1-003.zip", []file{third}), Options{})
+			acct, _ := f.st.GetAccount(f.ctx, "alice")
+			stillItem, _ := f.st.FindItemByKey(f.ctx, acct.ID, "GID1#original")
+			motionItem, _ := f.st.FindItemByKey(f.ctx, acct.ID, "GID1#motion")
+			if stillItem == nil || motionItem == nil || stillItem.Filename != "20230621_145830.jpg" || motionItem.Filename != "20230621_145830.MP4" {
+				t.Fatalf("still %+v, motion %+v (result %+v)", stillItem, motionItem, r)
+			}
+			if c, _ := f.st.Counts(f.ctx, acct.ID); c["items_fallback"] != 0 || c["pending_sidecars"] != 0 {
+				t.Errorf("counts %v", c)
+			}
+		})
+	}
+}
+
+// A still that an earlier version of the companion rule left nameless, with
+// its sidecar row deferred as a collision with its own motion companion
+// (the 2026-10-11 export of a Russian account: 100 such pairs), is promoted by
+// the resolver, which re-judges deferred rows with the current rule.
+func TestDeferredStillOfMotionPairPromoted(t *testing.T) {
+	f := newFixture(t)
+	const dir = gp + "Photos from 2023/"
+	const export, folder, key = "20261010T221633Z-1", "Photos from 2023", "20230621_145830.jpg"
+	raw := sidecar(key, "GID1", tJuly, "")
+	f.ingest("alice", f.zip("takeout-20261010T221633Z-1-001.zip", []file{{dir + key + ".supplemental-metadata.json", raw}}), Options{})
+	f.ingest("alice", f.zip("takeout-20261010T221633Z-1-002.zip", []file{{dir + "20230621_145830.MP4", randBytes(70)}}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
+	// the still arrives while its sidecar is out of reach: a nameless item
+	if err := f.st.DeletePendingSidecar(f.ctx, acct.ID, export, folder, key); err != nil {
+		t.Fatal(err)
+	}
+	f.ingest("alice", f.zip("takeout-20261010T221633Z-1-003.zip", []file{{dir + key, randBytes(71)}}), Options{})
+	if c, _ := f.st.Counts(f.ctx, acct.ID); c["items_fallback"] != 1 {
+		t.Fatalf("setup: counts %v", c)
+	}
+	// the row as the earlier rule left it: stored, deferred to the still, unresolved
+	if err := f.st.PutPendingSidecar(f.ctx, acct.ID, export, 1, folder, key, raw, "GID1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.DeferPendingSidecar(f.ctx, acct.ID, export, folder, key, key, takeout.VariantOriginal, key); err != nil {
+		t.Fatal(err)
+	}
+	links, promoted, err := f.ing.ResolvePending(f.ctx, acct, export, false)
+	if err != nil || promoted != 1 {
+		t.Fatalf("resolve: links %d, promoted %d, err %v", links, promoted, err)
+	}
+	still, _ := f.st.FindItemByKey(f.ctx, acct.ID, "GID1#original")
+	motion, _ := f.st.FindItemByKey(f.ctx, acct.ID, "GID1#motion")
+	if still == nil || motion == nil || still.Filename != key || motion.Filename != "20230621_145830.MP4" {
+		t.Fatalf("still %+v, motion %+v", still, motion)
+	}
+	if c, _ := f.st.Counts(f.ctx, acct.ID); c["items_fallback"] != 0 || c["pending_sidecars"] != 0 {
+		t.Errorf("counts %v", c)
+	}
+}

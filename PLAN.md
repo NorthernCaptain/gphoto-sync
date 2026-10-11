@@ -65,6 +65,11 @@ one official path that delivers originals: **Google Takeout → Google Drive →
     without downloading it again; a part recorded as ingested without a single recognized
     entry (`archives.recognized`, or no media seen for rows older than that column) is
     ingested again from scratch.
+  - a motion photo may come as `X.jpg` + `X.MP4` (Samsung) with one sidecar, the three spread
+    over parts in any order. Whichever file is committed first takes the Google id; when the
+    other arrives, the known item delivered beside it under a name sharing the stem is its
+    companion, not a name collision (100 stills of the 2026-10-11 export were deferred as
+    collisions before this rule; the resolver re-judges deferred rows and promoted them).
   - album folders do **not** always hold the media: for many members Takeout writes only
     the sidecar JSON into the album folder while the file itself sits in its year folder
     (844 of 43,591 items in the 2026-10-07 export). Such a sidecar-only entry is an album

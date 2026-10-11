@@ -1882,7 +1882,7 @@ func (ing *Ingester) resolvePendingPass(ctx context.Context, acct *store.Account
 				continue
 			}
 			sc.SourcePart = r.PartNo
-			pr := &partRun{ing: ing, ctx: ctx, acct: acct, part: PartMeta{Account: acct.Name, ExportID: exportID, PartNo: r.PartNo, Name: "pending:" + r.Key}, folders: map[string]*folderCtx{}}
+			pr := &partRun{ing: ing, ctx: ctx, acct: acct, part: PartMeta{Account: acct.Name, ExportID: exportID, PartNo: r.PartNo, Name: "pending:" + r.Key}, folders: map[string]*folderCtx{}, rules: rules}
 			// the media the sidecar relates to: the entry a heuristic match of a
 			// part was deferred for (recorded with its variant), and media under a
 			// name the index could not relate at the time, a title without
@@ -2077,7 +2077,14 @@ func (pr *partRun) nameCollision(folder string, m *takeout.Match, base, sha stri
 	if known, err = pr.ing.st.ItemsByGoogleIDAny(pr.ctx, pr.acct.ID, gid); err != nil || known == nil {
 		return nil, false, err
 	}
-	mate, err := pr.deliveredAsMate(folder, known, base, append([]string{m.Still}, mates...))
+	names := append([]string{m.Still}, mates...)
+	if takeout.SameStem(known.Filename, base) {
+		// the known photo was delivered under a name sharing this file's stem
+		// (20230621_145830.MP4 beside 20230621_145830.jpg): the companion of
+		// the same motion photo, whichever of the two was committed first
+		names = append(names, known.Filename)
+	}
+	mate, err := pr.deliveredAsMate(folder, known, base, names)
 	return known, !mate, err
 }
 
