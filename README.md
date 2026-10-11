@@ -1,5 +1,7 @@
 # gphoto-sync
 
+[MIT License](LICENSE) · [Project page](https://northerncaptain.github.io/gphoto-sync/)
+
 Mirrors the photos and videos of one or more Google accounts into a local folder tree on
 Linux, using Google Takeout scheduled exports delivered to Google Drive, fetched with rclone
 and ingested by this Go program. Runs as a weekly one-shot Docker container from a systemd
@@ -25,22 +27,24 @@ timer. Design and decisions: [PLAN.md](PLAN.md).
 2. **Takeout schedule per account** at takeout.google.com while signed in as that person:
    Google Photos only, monthly for one year, incremental after the first export,
    destination **Add to Drive**, zip, 50 GB parts.
-3. **Server layout** (see `deploy/systemd/gphoto-sync.service` for the mounts):
-   - `/home/leo/gphoto-sync` — this repo; `config/` is git- and docker-ignored and holds
+3. **Server layout** (see `deploy/systemd/gphoto-sync.service` for the mounts; `alice` stands
+   for the user that owns the data, and `deploy/install-units.sh` rewrites the paths and the
+   container uid/gid for whoever runs it with sudo):
+   - `/home/alice/gphoto-sync` — this repo; `config/` is git- and docker-ignored and holds
      `config.yaml` (start from `config/config.example.yaml`), `rclone/rclone.conf`,
      `telegram.token`.
-   - `/home/leo/gphoto-backup/data` — the library; a symlink to
+   - `/home/alice/gphoto-backup/data` — the library; a symlink to
      `/media/media_disk/gphoto-backup/data` on the backup HDD (ext4: album links are
      hardlinks, and the ingest moves each file from `data/<account>/.tmp` into place with
      `rename()`, so the temp dir must stay on the same filesystem as the library). The
      service has `RequiresMountsFor=/media/media_disk` and does not start without the disk.
-     `/home/leo/gphoto-backup/state` (SSD) — SQLite database, inbox staging (needs ~60 GB
+     `/home/alice/gphoto-backup/state` (SSD) — SQLite database, inbox staging (needs ~60 GB
      free) and the writer lock `gphoto-sync.lock` (a second `sync`/`ingest` started while
-     one runs exits 1 at once); `/home/leo/gphoto-backup/downloads` — manually downloaded
+     one runs exits 1 at once); `/home/alice/gphoto-backup/downloads` — manually downloaded
      parts for `ingest`.
 4. **Build and install**:
    ```sh
-   cd /home/leo/gphoto-sync && DOCKER_BUILDKIT=0 docker build -t gphoto-sync:local .
+   cd ~/gphoto-sync && DOCKER_BUILDKIT=0 docker build -t gphoto-sync:local .
    sudo deploy/install-units.sh
    ```
 5. **Telegram** (optional): create a bot with @BotFather, write its token to

@@ -4,7 +4,8 @@ Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
 # The library lives on the backup disk (reached through the symlink
-# /home/leo/gphoto-backup/data). Without this, a run while the disk is not
+# /home/alice/gphoto-backup/data; paths and --user are rewritten by
+# deploy/install-units.sh for the installing user). Without this, a run while the disk is not
 # mounted would make Docker create the bind source on the root filesystem
 # and ingest into it.
 RequiresMountsFor=/media/media_disk
@@ -16,8 +17,8 @@ ExecStartPre=-/usr/bin/docker rm -f gphoto-sync
 ExecStart=/usr/bin/docker run --rm --name gphoto-sync \
     --user 1000:1000 \
     -e TZ=America/Chicago \
-    -v /home/leo/gphoto-backup/data:/data \
-    -v /home/leo/gphoto-backup/state:/state \
-    -v /home/leo/gphoto-sync/config:/config \
+    -v /home/alice/gphoto-backup/data:/data \
+    -v /home/alice/gphoto-backup/state:/state \
+    -v /home/alice/gphoto-sync/config:/config \
     gphoto-sync:local sync
 ExecStop=-/usr/bin/docker stop -t 120 gphoto-sync

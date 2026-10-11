@@ -6,7 +6,7 @@ one subtree per account. It runs as a weekly one-shot container, not a daemon:
 
 ```
 <data>/
-  <email local part>/                        one subtree per Google account, e.g. leo/
+  <email local part>/                        one subtree per Google account, e.g. alice/
     library/YYYY/MM/<original filename>      every item, once
     library/YYYY/MM/<original filename>.json Takeout sidecar kept next to the file
     albums/<album title>/<filename>          own and shared albums (hardlinks into library/)
@@ -115,7 +115,7 @@ staging area for one 50 GB part at a time.
 **Accounts:** the service handles several Google accounts in one run. Each account is a
 config entry with its own rclone remote, and each person sets up their own Takeout schedule
 delivered to their own Drive. Files land under `/data/<account>/`, where the account name is the e-mail local part
-(`leo` for leo@…). Accounts are processed one after another, so the 50 GB staging limit
+(`alice` for alice@…). Accounts are processed one after another, so the 50 GB staging limit
 still holds. Identical files in two accounts (partner sharing, items saved from a shared
 album) share one inode via hardlink, see 3.3.
 
@@ -153,9 +153,9 @@ host                                   container (docker run --rm, weekly, exits
 │ gphoto-sync.service    │◄── exit ─── │   1. rclone lsjson <remote>  → new parts?        │
 │  (Type=exec)           │   code      │   2. rclone copyto <part> → /state/inbox         │
 │                        │             │   3. ingest zip → /data/<acct>/{library,albums}  │
-│ /home/leo/gphoto-backup/data   ────┼── /data ──► │   4. SQLite bookkeeping, delete local part       │
-│ /home/leo/gphoto-backup/state  ────┼── /state ─► │   5. next part, next account, report, exit       │
-│ /home/leo/gphoto-sync/config/rclone ────┼─ /config ─► │  binaries: /usr/local/bin/{gphoto-sync,rclone}   │
+│ /home/alice/gphoto-backup/data   ────┼── /data ──► │   4. SQLite bookkeeping, delete local part       │
+│ /home/alice/gphoto-backup/state  ────┼── /state ─► │   5. next part, next account, report, exit       │
+│ /home/alice/gphoto-sync/config/rclone ────┼─ /config ─► │  binaries: /usr/local/bin/{gphoto-sync,rclone}   │
 └────────────────────────┘             └──────────────────────────────────────────────────┘
 ```
 
@@ -181,7 +181,7 @@ host                                   container (docker run --rm, weekly, exits
 ### 3.2 One run, step by step (per account)
 
 1. **Discover**: `rclone lsjson --hash --files-only <remote>` where `<remote>` is the
-   account's `rclone_remote` (for example `gdrive-leo:Takeout`). Each entry gives `ID` (Drive
+   account's `rclone_remote` (for example `gdrive-alice:Takeout`). Each entry gives `ID` (Drive
    file id), `Name`, `Size`, `ModTime`, and `Hashes.MD5`. Keep files matching
    `takeout-<timestamp>-<seq>-<NNN>.zip` (real example:
    `takeout-20261006T035113Z-1-001.zip`). The **export id** is `<timestamp>-<seq>`
@@ -596,8 +596,8 @@ rclone:
   config: /config/rclone/rclone.conf   # one file, one [section] per account; mounted read-write
   extra_args: ["--multi-thread-streams", "4", "--retries", "5", "--low-level-retries", "20"]
 accounts:                  # key = e-mail local part = folder name under data_dir
-  leo:
-    rclone_remote: "gdrive-leo:Takeout"
+  alice:
+    rclone_remote: "gdrive-alice:Takeout"
   jane:                                # example for the second account
     rclone_remote: "gdrive-jane:Takeout"
     takeout: { settle: 4h }            # optional override of takeout.* for this account
@@ -680,36 +680,36 @@ non-zero as a failed unit; the Telegram report carries the detail.
    - *SSH port forward*: run `rclone config` on the server, answer "no" to "use web
      browser", it prints a `http://127.0.0.1:53682/...` URL; from the laptop
      `ssh -L 53682:127.0.0.1:53682 server`, open the URL locally, sign in.
-   The server's `/home/leo/gphoto-sync/config/rclone/rclone.conf` ends up with one `[section]` per account
+   The server's `/home/alice/gphoto-sync/config/rclone/rclone.conf` ends up with one `[section]` per account
    (sections can be concatenated by hand; the existing `[gdrive]` can be renamed to
-   `[gdrive-leo]` by editing the header). Owned by the service UID, mode 0600. Treat it as a
+   `[gdrive-alice]` by editing the header). Owned by the service UID, mode 0600. Treat it as a
    password: it holds every account's refresh token. Verify with
-   `rclone --config /home/leo/gphoto-sync/config/rclone/rclone.conf lsd gdrive-jane:`.
+   `rclone --config /home/alice/gphoto-sync/config/rclone/rclone.conf lsd gdrive-jane:`.
 2. **One Takeout schedule per account**, created while signed in as that person at
    takeout.google.com (done for your account on 2026-10-05): Google Photos only, monthly for
    one year, incremental after the first export, destination that person's Drive, zip,
    50 GB parts. Each account's Drive needs room for its own full export. Renew after
    12 months; the overdue exit code (per account) is the reminder.
 3. **Telegram bot**: create it with @BotFather, save the token to
-   `/home/leo/gphoto-sync/config/telegram.token` (service UID, mode 0600), then run
+   `/home/alice/gphoto-sync/config/telegram.token` (service UID, mode 0600), then run
    `docker run --rm -it <mounts> gphoto-sync:local telegram pair --people 2`.
    It prints one single-use code per person; each person opens a private chat with the bot
    and sends `/start <their code>`. `telegram test` confirms delivery.
-4. **Host** (checked 2026-10-06): `home-nvr`, `ssh leo@10.19.76.5`, Ubuntu 22.04 x86-64,
-   Docker 27.5 + Compose v2.23, user `leo` (uid/gid 1000, docker group, passwordless
+4. **Host** (checked 2026-10-06): `ssh alice@<server>`, Ubuntu 22.04 x86-64,
+   Docker 27.5 + Compose v2.23, user `alice` (uid/gid 1000, docker group, passwordless
    sudo), ext4 root with ~270 GB free: enough for the 182 GB library plus 50 GB staging
    of one account; the extra backup disk should arrive before the second account's full
    export. Layout:
-   - `/home/leo/gphoto-sync` — git clone of this repo; the image is built here with
+   - `/home/alice/gphoto-sync` — git clone of this repo; the image is built here with
      `docker build -t gphoto-sync:local .`; `config/` holds `config.yaml`,
      `rclone/rclone.conf`, `telegram.token` and is excluded both by `.gitignore` and by
      `.dockerignore`, so credentials never enter the build context or an image layer.
-   - `/home/leo/gphoto-backup/data` — all accounts' `library/` and `albums/`; since
+   - `/home/alice/gphoto-backup/data` — all accounts' `library/` and `albums/`; since
      2026-10-09 a symlink to `/media/media_disk/gphoto-backup/data` on the backup HDD
      (ext4, so hardlinks and the same-filesystem `rename()` from `.tmp` keep working; the
-     unit has `RequiresMountsFor=/media/media_disk`). `/home/leo/gphoto-backup/state` —
+     unit has `RequiresMountsFor=/media/media_disk`). `/home/alice/gphoto-backup/state` —
      DB and inbox staging, on the SSD (DB paths are `data_dir`-relative, so the library
-     can move again without touching the DB); `/home/leo/gphoto-backup/downloads` —
+     can move again without touching the DB); `/home/alice/gphoto-backup/downloads` —
      manually downloaded parts for `gphoto-sync ingest`.
 5. **Install units** from 3.8, `systemctl enable --now gphoto-sync.timer`, and run the first
    pass by hand with `systemctl start gphoto-sync.service` while watching
@@ -737,11 +737,11 @@ nothing is ever half-written (temp file + rename). Memory during a run is bounde
 central directory of a 50 GB part is a few MB, media are streamed, rclone uses its own
 transfer buffers. Between runs nothing is resident.
 
-**Mounts** (`-v host:container`): `/home/leo/gphoto-backup/data:/data`, `/home/leo/gphoto-backup/state:/state`,
-`/home/leo/gphoto-sync/config/rclone:/config/rclone` (read-write: rclone persists refreshed access tokens;
-read-only would work but log an error every run), `/home/leo/gphoto-sync/config/config.yaml:/config/config.yaml:ro`,
-`/home/leo/gphoto-sync/config/telegram.token:/config/telegram.token:ro`.
-`--user 1000:1000` (leo, who owns `/home/leo/gphoto-backup`), so files are not root-owned.
+**Mounts** (`-v host:container`): `/home/alice/gphoto-backup/data:/data`, `/home/alice/gphoto-backup/state:/state`,
+`/home/alice/gphoto-sync/config/rclone:/config/rclone` (read-write: rclone persists refreshed access tokens;
+read-only would work but log an error every run), `/home/alice/gphoto-sync/config/config.yaml:/config/config.yaml:ro`,
+`/home/alice/gphoto-sync/config/telegram.token:/config/telegram.token:ro`.
+`--user 1000:1000` (alice, who owns `/home/alice/gphoto-backup`), so files are not root-owned.
 
 **systemd**:
 
@@ -760,11 +760,11 @@ ExecStartPre=-/usr/bin/docker rm -f gphoto-sync
 ExecStart=/usr/bin/docker run --rm --name gphoto-sync \
     --user 1000:1000 \
     -e TZ=America/Chicago \
-    -v /home/leo/gphoto-backup/data:/data \
-    -v /home/leo/gphoto-backup/state:/state \
-    -v /home/leo/gphoto-sync/config/rclone:/config/rclone \
-    -v /home/leo/gphoto-sync/config/config.yaml:/config/config.yaml:ro \
-    -v /home/leo/gphoto-sync/config/telegram.token:/config/telegram.token:ro \
+    -v /home/alice/gphoto-backup/data:/data \
+    -v /home/alice/gphoto-backup/state:/state \
+    -v /home/alice/gphoto-sync/config/rclone:/config/rclone \
+    -v /home/alice/gphoto-sync/config/config.yaml:/config/config.yaml:ro \
+    -v /home/alice/gphoto-sync/config/telegram.token:/config/telegram.token:ro \
     gphoto-sync:local sync
 ExecStop=-/usr/bin/docker stop -t 120 gphoto-sync
 ```
@@ -928,7 +928,7 @@ than Telegram.
 | Acquisition path | Takeout → Drive → rclone → gphoto-sync, nothing else |
 | Export | Monthly, incremental after the first full export, zip, 50 GB parts, delivered to each person's Drive |
 | Run cadence | Weekly one-shot container from a systemd timer; no daemon |
-| Accounts | Several; folder and config key = e-mail local part (`leo`, …); one rclone remote and one Takeout schedule each |
+| Accounts | Several; folder and config key = e-mail local part (`alice`, …); one rclone remote and one Takeout schedule each |
 | Album links | Hardlinks; `data/` on one local filesystem |
 | Cross-account dedup | On, always: identical bytes anywhere share one blob (inode); each item keeps its own path and metadata |
 | Collisions | Deterministic suffix from the item identity: `IMG_1234~3fa9c1d2.jpg` |

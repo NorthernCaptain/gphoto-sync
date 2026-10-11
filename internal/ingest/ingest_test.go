@@ -40,7 +40,7 @@ func newFixture(t *testing.T) *fixture {
 	cfg.StateDir = filepath.Join(root, "state")
 	cfg.Workers = 2
 	cfg.Timezone = "UTC"
-	cfg.Accounts = map[string]config.Account{"leo": {}, "jane": {}}
+	cfg.Accounts = map[string]config.Account{"alice": {}, "jane": {}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestIngestEndToEnd(t *testing.T) {
 		{gp + "Photos from 2020/Z.jpg", randBytes(700)},
 	})
 
-	r1 := f.ingest("leo", part1, Options{})
+	r1 := f.ingest("alice", part1, Options{})
 	if r1.Status != store.ArchiveIngested {
 		t.Fatalf("part1 status %s", r1.Status)
 	}
@@ -181,17 +181,17 @@ func TestIngestEndToEnd(t *testing.T) {
 		t.Errorf("added %d want 6 (%+v)", r1.Added, r1)
 	}
 	f.mustExist(
-		"leo/library/2022/07/IMG_1.jpg", "leo/library/2022/07/IMG_1.jpg.json",
-		"leo/library/2022/03/IMG_1.jpg", // BBB, different month, same name
-		"leo/library/2022/07/IMG_1-edited.jpg",
-		"leo/library/2022/07/PXL_9.MP.jpg", "leo/library/2022/07/PXL_9.MP",
-		"leo/library/2021/00/B.jpg", // folder year only
-		"leo/albums/Trip/IMG_1.jpg", "leo/albums/Trip/PXL_9.MP.jpg", "leo/albums/Trip/PXL_9.MP",
+		"alice/library/2022/07/IMG_1.jpg", "alice/library/2022/07/IMG_1.jpg.json",
+		"alice/library/2022/03/IMG_1.jpg", // BBB, different month, same name
+		"alice/library/2022/07/IMG_1-edited.jpg",
+		"alice/library/2022/07/PXL_9.MP.jpg", "alice/library/2022/07/PXL_9.MP",
+		"alice/library/2021/00/B.jpg", // folder year only
+		"alice/albums/Trip/IMG_1.jpg", "alice/albums/Trip/PXL_9.MP.jpg", "alice/albums/Trip/PXL_9.MP",
 	)
-	if f.exists("leo/library/0000/00/old.jpg") || f.exists("leo/albums/Trash") {
+	if f.exists("alice/library/0000/00/old.jpg") || f.exists("alice/albums/Trash") {
 		t.Error("trash was ingested")
 	}
-	if !f.sameInode("leo/library/2022/07/IMG_1.jpg", "leo/albums/Trip/IMG_1.jpg") {
+	if !f.sameInode("alice/library/2022/07/IMG_1.jpg", "alice/albums/Trip/IMG_1.jpg") {
 		t.Error("album link is not a hardlink")
 	}
 	if r1.PendingSidecars != 1 {
@@ -199,15 +199,15 @@ func TestIngestEndToEnd(t *testing.T) {
 	}
 
 	// part 2: album descriptor renames the provisional album, B gets promoted, Z arrives for its waiting sidecar
-	r2 := f.ingest("leo", part2, Options{})
+	r2 := f.ingest("alice", part2, Options{})
 	if r2.Promoted != 1 || r2.Added != 1 {
 		t.Errorf("part2: promoted %d added %d (%+v)", r2.Promoted, r2.Added, r2)
 	}
-	f.mustExist("leo/albums/Trip to Austin/IMG_1.jpg", "leo/library/2022/03/B.jpg", "leo/library/2022/03/B.jpg.json", "leo/library/2022/07/Z.jpg")
-	if f.exists("leo/albums/Trip") || f.exists("leo/library/2021/00/B.jpg") {
+	f.mustExist("alice/albums/Trip to Austin/IMG_1.jpg", "alice/library/2022/03/B.jpg", "alice/library/2022/03/B.jpg.json", "alice/library/2022/07/Z.jpg")
+	if f.exists("alice/albums/Trip") || f.exists("alice/library/2021/00/B.jpg") {
 		t.Error("old paths still present after rename/promotion")
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "DDD#original")
 	if it == nil || it.IdentitySrc != store.IdentityGoogle {
 		t.Fatalf("B not promoted: %+v", it)
@@ -219,8 +219,8 @@ func TestIngestEndToEnd(t *testing.T) {
 	}
 
 	// idempotency: nothing changes on a re-run
-	r1b := f.ingest("leo", part1, Options{})
-	r2b := f.ingest("leo", part2, Options{})
+	r1b := f.ingest("alice", part1, Options{})
+	r2b := f.ingest("alice", part2, Options{})
 	if r1b.Added+r2b.Added+r1b.Promoted+r2b.Promoted+r1b.Changed+r2b.Changed != 0 {
 		t.Errorf("re-run changed things: %+v %+v", r1b, r2b)
 	}
@@ -232,7 +232,7 @@ func TestIngestEndToEnd(t *testing.T) {
 	if err := f.st.SetExportConfirmedParts(f.ctx, acct.ID, "20261006T035113Z-1", 2, false); err != nil {
 		t.Fatal(err)
 	}
-	pres, err := f.ing.Prune(f.ctx, "leo", "20261006T035113Z-1", false)
+	pres, err := f.ing.Prune(f.ctx, "alice", "20261006T035113Z-1", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,15 +245,15 @@ func TestIngestEndToEnd(t *testing.T) {
 		{gp + "Photos from 2022/IMG_1.jpg", randBytes(3333)},
 		{gp + "Photos from 2022/IMG_1.jpg.supplemental-metadata.json", sidecar("IMG_1.jpg", "AAA", tJuly, `,"description":"re-edited"`)},
 	})
-	r3 := f.ingest("leo", part3, Options{})
+	r3 := f.ingest("alice", part3, Options{})
 	if r3.Changed != 1 || r3.Added != 0 {
 		t.Errorf("part3: %+v", r3)
 	}
-	entries, _ := filepath.Glob(filepath.Join(f.cfg.DataDir, "leo/library/2022/07/IMG_1~v*.jpg"))
+	entries, _ := filepath.Glob(filepath.Join(f.cfg.DataDir, "alice/library/2022/07/IMG_1~v*.jpg"))
 	if len(entries) != 1 {
 		t.Errorf("superseded version not kept: %v", entries)
 	}
-	if !f.sameInode("leo/library/2022/07/IMG_1.jpg", "leo/albums/Trip to Austin/IMG_1.jpg") {
+	if !f.sameInode("alice/library/2022/07/IMG_1.jpg", "alice/albums/Trip to Austin/IMG_1.jpg") {
 		t.Error("album link not re-pointed after supersede")
 	}
 
@@ -264,15 +264,15 @@ func TestIngestEndToEnd(t *testing.T) {
 		{gp + "Trip /PXL_9.MP.jpg.supplemental-metadata.json", sidecar("PXL_9.MP.jpg", "CCC", tJuly, "")},
 		{gp + "Trip /PXL_9.MP", mpMotion},
 	})
-	f.ingest("leo", part4, Options{FullAlbums: true, Parts: 1})
-	pres, err = f.ing.Prune(f.ctx, "leo", "20261206T000000Z-3", false)
+	f.ingest("alice", part4, Options{FullAlbums: true, Parts: 1})
+	pres, err = f.ing.Prune(f.ctx, "alice", "20261206T000000Z-3", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pres.Removed != 1 || f.exists("leo/albums/Trip to Austin/IMG_1.jpg") {
+	if pres.Removed != 1 || f.exists("alice/albums/Trip to Austin/IMG_1.jpg") {
 		t.Errorf("prune did not remove the stale link: %+v", pres)
 	}
-	f.mustExist("leo/albums/Trip to Austin/PXL_9.MP.jpg", "leo/albums/Trip to Austin/PXL_9.MP", "leo/library/2022/07/IMG_1.jpg")
+	f.mustExist("alice/albums/Trip to Austin/PXL_9.MP.jpg", "alice/albums/Trip to Austin/PXL_9.MP", "alice/library/2022/07/IMG_1.jpg")
 
 	// second account with the same bytes: one blob, two items
 	jane := f.zip("takeout-20261007T000000Z-1-001.zip", []file{
@@ -293,7 +293,7 @@ func TestIngestEndToEnd(t *testing.T) {
 	}
 
 	// verify is clean
-	v, err := f.ing.Verify(f.ctx, "leo", true)
+	v, err := f.ing.Verify(f.ctx, "alice", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,16 +313,16 @@ func TestResumeAfterFailure(t *testing.T) {
 		{gp + "Photos from 2022/C.jpg", randBytes(100)},
 		{gp + "Photos from 2022/C.jpg.supplemental-metadata.json", sidecar("C.jpg", "CCC", tJuly, "")},
 	})
-	r := f.ingest("leo", p, Options{MaxEntries: 1})
+	r := f.ingest("alice", p, Options{MaxEntries: 1})
 	if r.Added != 1 {
 		t.Fatalf("first pass added %d", r.Added)
 	}
-	r = f.ingest("leo", p, Options{})
+	r = f.ingest("alice", p, Options{})
 	if r.Added != 1 || r.Duplicates != 0 {
 		t.Errorf("resume: %+v", r)
 	}
 	// simulate a crash after the file move but before the DB commit: journal replay must be harmless
-	id, _ := f.st.JournalBegin(f.ctx, "create", `[{"op":"rename","src":"leo/.tmp/x","dst":"leo/library/2022/07/A.jpg"}]`)
+	id, _ := f.st.JournalBegin(f.ctx, "create", `[{"op":"rename","src":"alice/.tmp/x","dst":"alice/library/2022/07/A.jpg"}]`)
 	_ = id
 	if err := f.ing.RecoverJournal(f.ctx); err != nil {
 		t.Fatal(err)
@@ -330,7 +330,7 @@ func TestResumeAfterFailure(t *testing.T) {
 	if open, _ := f.st.JournalOpen(f.ctx); len(open) != 0 {
 		t.Error("journal not drained")
 	}
-	f.mustExist("leo/library/2022/07/A.jpg", "leo/library/2022/07/C.jpg")
+	f.mustExist("alice/library/2022/07/A.jpg", "alice/library/2022/07/C.jpg")
 }
 
 func TestParsePartName(t *testing.T) {
@@ -365,8 +365,8 @@ func (f *fixture) read(rel string) []byte {
 func TestOlderExportKeepsNewerContent(t *testing.T) {
 	f := newFixture(t)
 	newer, older, newest := randBytes(120), randBytes(130), randBytes(140)
-	lib := "leo/library/2022/07/A.jpg"
-	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	lib := "alice/library/2022/07/A.jpg"
+	f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", newer},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, `,"favorited":true`)},
 	}), Options{})
@@ -375,7 +375,7 @@ func TestOlderExportKeepsNewerContent(t *testing.T) {
 		{gp + "Photos from 2022/A.jpg", older},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	})
-	r := f.ingest("leo", old, Options{})
+	r := f.ingest("alice", old, Options{})
 	if r.Versioned != 1 || r.Changed != 0 || r.Duplicates != 0 || r.Added != 0 {
 		t.Fatalf("older export: %+v", r)
 	}
@@ -385,29 +385,29 @@ func TestOlderExportKeepsNewerContent(t *testing.T) {
 	if !bytes.Contains(f.read(lib+".json"), []byte(`"favorited":true`)) {
 		t.Error("older export replaced the newer sidecar")
 	}
-	ver := "leo/library/2022/07/A~v" + sha8(older) + ".jpg"
+	ver := "alice/library/2022/07/A~v" + sha8(older) + ".jpg"
 	f.mustExist(ver)
 	if !bytes.Equal(f.read(ver), older) {
 		t.Error("kept version has wrong content")
 	}
 	// the same older part again skips its finished entries
-	r = f.ingest("leo", old, Options{})
+	r = f.ingest("alice", old, Options{})
 	if r.Versioned != 0 || r.Changed != 0 || r.Added != 0 {
 		t.Errorf("older export re-run: %+v", r)
 	}
 	// another part of the older export carrying the same file: already kept
-	r = f.ingest("leo", f.zip("takeout-20261006T000000Z-1-002.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-20261006T000000Z-1-002.zip", []file{
 		{gp + "Photos from 2022/A.jpg", older},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{})
 	if r.Versioned != 0 || r.Changed != 0 || r.Duplicates != 1 {
 		t.Errorf("older export, second part: %+v", r)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 	// a newer export still supersedes, keeping the previous bytes
-	r = f.ingest("leo", f.zip("takeout-20261206T000000Z-1-001.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-20261206T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", newest},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, `,"favorited":true`)},
 	}), Options{})
@@ -417,8 +417,8 @@ func TestOlderExportKeepsNewerContent(t *testing.T) {
 	if !bytes.Equal(f.read(lib), newest) {
 		t.Error("newest export did not replace the bytes")
 	}
-	f.mustExist("leo/library/2022/07/A~v" + sha8(newer) + ".jpg")
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	f.mustExist("alice/library/2022/07/A~v" + sha8(newer) + ".jpg")
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -439,13 +439,13 @@ func TestRepairedSidecarAppliedOnRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	meta := PartMeta{Account: "leo", ExportID: "20261006T035113Z-1", PartNo: 1, Name: name}
+	meta := PartMeta{Account: "alice", ExportID: "20261006T035113Z-1", PartNo: 1, Name: name}
 	res, err := f.ing.IngestPart(f.ctx, src, meta, Options{})
 	src.Close()
 	if err != nil || res.Added != 2 || res.Failed != 2 || res.Status != store.ArchivePartial {
 		t.Fatalf("first run: %+v %v", res, err)
 	}
-	f.mustExist("leo/library/2022/00/A.jpg", "leo/library/2022/00/B.jpg")
+	f.mustExist("alice/library/2022/00/A.jpg", "alice/library/2022/00/B.jpg")
 
 	// the retry reads both sidecars fine; B's carries no Google id
 	p = f.zip(name, []file{
@@ -454,26 +454,26 @@ func TestRepairedSidecarAppliedOnRetry(t *testing.T) {
 		{gp + "Photos from 2022/B.jpg", b},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", []byte(fmt.Sprintf(`{"title":"B.jpg","photoTakenTime":{"timestamp":"%d"}}`, tMar))},
 	})
-	r := f.ingest("leo", p, Options{})
+	r := f.ingest("alice", p, Options{})
 	if r.Status != store.ArchiveIngested || r.Failed != 0 || r.Promoted != 1 || r.Added != 0 {
 		t.Fatalf("retry: %+v", r)
 	}
-	f.mustExist("leo/library/2022/07/A.jpg", "leo/library/2022/07/A.jpg.json", "leo/library/2022/03/B.jpg", "leo/library/2022/03/B.jpg.json")
-	if f.exists("leo/library/2022/00/A.jpg") || f.exists("leo/library/2022/00/B.jpg") {
+	f.mustExist("alice/library/2022/07/A.jpg", "alice/library/2022/07/A.jpg.json", "alice/library/2022/03/B.jpg", "alice/library/2022/03/B.jpg.json")
+	if f.exists("alice/library/2022/00/A.jpg") || f.exists("alice/library/2022/00/B.jpg") {
 		t.Error("files left at the folder-year path")
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original"); it == nil {
 		t.Error("A.jpg did not get its Google identity")
 	}
 	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 {
 		t.Errorf("%d pending sidecars after retry", n)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 	// a third run changes nothing
-	r = f.ingest("leo", p, Options{})
+	r = f.ingest("alice", p, Options{})
 	if r.Promoted != 0 || r.Changed != 0 || r.Added != 0 || r.Duplicates != 0 {
 		t.Errorf("third run: %+v", r)
 	}
@@ -488,28 +488,28 @@ func TestReplacedPartIsReconciled(t *testing.T) {
 	name := "takeout-" + export + "-001.zip"
 	a, b := randBytes(100), randBytes(110)
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
-	f.ingest("leo", f.zip(name, []file{
+	f.ingest("alice", f.zip(name, []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 		{gp + "Trip /B.jpg", b},
 		{gp + "Trip /B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{FullAlbums: true, Parts: 1})
-	if pres, err := f.ing.Prune(f.ctx, "leo", export, false); err != nil || pres.Skipped != "" || pres.Removed != 0 {
+	if pres, err := f.ing.Prune(f.ctx, "alice", export, false); err != nil || pres.Skipped != "" || pres.Removed != 0 {
 		t.Fatalf("first prune: %+v %v", pres, err)
 	}
-	f.mustExist("leo/albums/Trip to Austin/A.jpg", "leo/albums/Trip to Austin/B.jpg")
-	if ids, _ := f.ing.PrunableExports(f.ctx, "leo"); len(ids) != 0 {
+	f.mustExist("alice/albums/Trip to Austin/A.jpg", "alice/albums/Trip to Austin/B.jpg")
+	if ids, _ := f.ing.PrunableExports(f.ctx, "alice"); len(ids) != 0 {
 		t.Fatalf("export still prunable after pruning: %v", ids)
 	}
 
 	// the replacement no longer lists B in the album
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	arch, _ := f.st.GetArchive(f.ctx, acct.ID, export, 1)
 	if err := f.st.ResetPartForReingest(f.ctx, arch.ID, acct.ID, export, 1); err != nil {
 		t.Fatal(err)
 	}
-	r := f.ingest("leo", f.zip(name, []file{
+	r := f.ingest("alice", f.zip(name, []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
@@ -517,20 +517,20 @@ func TestReplacedPartIsReconciled(t *testing.T) {
 	if r.Status != store.ArchiveIngested || r.Duplicates != 1 || r.Added != 0 || r.Unlinked != 1 {
 		t.Fatalf("re-ingest: %+v", r)
 	}
-	if f.exists("leo/albums/Trip to Austin/B.jpg") {
+	if f.exists("alice/albums/Trip to Austin/B.jpg") {
 		t.Error("stale album link of the replaced part survived the re-ingest")
 	}
 	// the listing is applied again; nothing is left for it to remove
-	ids, _ := f.ing.PrunableExports(f.ctx, "leo")
+	ids, _ := f.ing.PrunableExports(f.ctx, "alice")
 	if len(ids) != 1 || ids[0] != export {
 		t.Fatalf("export not prunable again: %v", ids)
 	}
-	pres, err := f.ing.Prune(f.ctx, "leo", export, false)
+	pres, err := f.ing.Prune(f.ctx, "alice", export, false)
 	if err != nil || pres.Skipped != "" || pres.Removed != 0 {
 		t.Fatalf("second prune: %+v %v", pres, err)
 	}
-	f.mustExist("leo/albums/Trip to Austin/A.jpg", "leo/library/2022/07/A.jpg", "leo/library/2022/07/B.jpg")
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	f.mustExist("alice/albums/Trip to Austin/A.jpg", "alice/library/2022/07/A.jpg", "alice/library/2022/07/B.jpg")
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -541,28 +541,28 @@ func TestReplacedPartIsReconciled(t *testing.T) {
 func TestMoveRecoversAfterCrash(t *testing.T) {
 	f := newFixture(t)
 	a := randBytes(100)
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", a},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{})
 	// what journal replay leaves behind: the bytes at the new month, the row at the old one
-	oldAbs, newAbs := filepath.Join(f.cfg.DataDir, "leo/library/2022/07/A.jpg"), filepath.Join(f.cfg.DataDir, "leo/library/2022/03/A.jpg")
+	oldAbs, newAbs := filepath.Join(f.cfg.DataDir, "alice/library/2022/07/A.jpg"), filepath.Join(f.cfg.DataDir, "alice/library/2022/03/A.jpg")
 	os.MkdirAll(filepath.Dir(newAbs), 0o755)
 	if err := os.Rename(oldAbs, newAbs); err != nil {
 		t.Fatal(err)
 	}
-	r := f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", a},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tMar, "")},
 	}), Options{})
 	if r.Changed != 1 || r.Failed != 0 {
 		t.Fatalf("retry after crash: %+v", r)
 	}
-	f.mustExist("leo/library/2022/03/A.jpg", "leo/library/2022/03/A.jpg.json")
-	if entries, _ := filepath.Glob(filepath.Join(f.cfg.DataDir, "leo/library/2022/03/A~*.jpg")); len(entries) != 0 {
+	f.mustExist("alice/library/2022/03/A.jpg", "alice/library/2022/03/A.jpg.json")
+	if entries, _ := filepath.Glob(filepath.Join(f.cfg.DataDir, "alice/library/2022/03/A~*.jpg")); len(entries) != 0 {
 		t.Errorf("item was renamed to a suffixed path: %v", entries)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -573,14 +573,14 @@ func TestDryRunWritesNothing(t *testing.T) {
 		{gp + "Photos from 2022/A.jpg", randBytes(100)},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	})
-	r := f.ingest("leo", p, Options{DryRun: true})
+	r := f.ingest("alice", p, Options{DryRun: true})
 	if r.Status != "dry-run" || r.Media != 1 {
 		t.Fatalf("dry run: %+v", r)
 	}
-	if acct, _ := f.st.GetAccount(f.ctx, "leo"); acct != nil {
+	if acct, _ := f.st.GetAccount(f.ctx, "alice"); acct != nil {
 		t.Error("dry run created the account row")
 	}
-	if f.exists("leo") {
+	if f.exists("alice") {
 		t.Error("dry run created files under data_dir")
 	}
 }
@@ -592,45 +592,45 @@ func TestDryRunWritesNothing(t *testing.T) {
 func TestLateSidecarMergesNewerBytes(t *testing.T) {
 	f := newFixture(t)
 	x, y := randBytes(100), randBytes(120)
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", x},
 		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, "")},
 	}), Options{})
-	r := f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", y},
 	}), Options{})
 	if r.Added != 1 {
 		t.Fatalf("newer bytes without sidecar: %+v", r)
 	}
-	r = f.ingest("leo", f.zip("takeout-20261106T000000Z-1-002.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-20261106T000000Z-1-002.zip", []file{
 		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, `,"favorited":true`)},
 	}), Options{})
 	if r.Merged != 1 || r.Changed != 1 || r.Failed != 0 {
 		t.Fatalf("late sidecar: %+v", r)
 	}
-	lib := "leo/library/2022/07/X.jpg"
+	lib := "alice/library/2022/07/X.jpg"
 	if !bytes.Equal(f.read(lib), y) {
 		t.Error("newer bytes are not current after the merge")
 	}
-	f.mustExist("leo/library/2022/07/X~v" + sha8(x) + ".jpg")
+	f.mustExist("alice/library/2022/07/X~v" + sha8(x) + ".jpg")
 	if !bytes.Contains(f.read(lib+".json"), []byte(`"favorited":true`)) {
 		t.Error("arriving sidecar was not applied")
 	}
-	if f.exists("leo/library/2022/00/X.jpg") {
+	if f.exists("alice/library/2022/00/X.jpg") {
 		t.Error("fallback file left behind")
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if c, _ := f.st.Counts(f.ctx, acct.ID); c["items"] != 1 {
 		t.Errorf("items: %d", c["items"])
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 
 	// an even newer export confirms the same bytes, again before its sidecar:
 	// the merge must move the bytes' export forward
-	f.ingest("leo", f.zip("takeout-20261206T000000Z-1-001.zip", []file{{gp + "Photos from 2022/X.jpg", y}}), Options{})
-	r = f.ingest("leo", f.zip("takeout-20261206T000000Z-1-002.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261206T000000Z-1-001.zip", []file{{gp + "Photos from 2022/X.jpg", y}}), Options{})
+	r = f.ingest("alice", f.zip("takeout-20261206T000000Z-1-002.zip", []file{
 		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, `,"favorited":true`)},
 	}), Options{})
 	if r.Merged != 1 || r.Changed != 0 {
@@ -641,14 +641,14 @@ func TestLateSidecarMergesNewerBytes(t *testing.T) {
 	}
 	// a delayed export from in between with other bytes may not replace them
 	z := randBytes(130)
-	r = f.ingest("leo", f.zip("takeout-20261120T000000Z-1-001.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-20261120T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", z},
 		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, "")},
 	}), Options{})
 	if r.Versioned != 1 || r.Changed != 0 || !bytes.Equal(f.read(lib), y) {
 		t.Errorf("delayed intermediate export replaced newer bytes: %+v", r)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -667,7 +667,7 @@ func TestReplacedLocalPartDetected(t *testing.T) {
 		}
 		defer src.Close()
 		fi, _ := os.Stat(p)
-		res, err := f.ing.IngestPart(f.ctx, src, PartMeta{Account: "leo", ExportID: "20261006T035113Z-1", PartNo: 1, Name: name, Size: fi.Size()}, opt)
+		res, err := f.ing.IngestPart(f.ctx, src, PartMeta{Account: "alice", ExportID: "20261006T035113Z-1", PartNo: 1, Name: name, Size: fi.Size()}, opt)
 		if err != nil || len(res.Errors) > 0 {
 			t.Fatalf("ingest: %v %v", err, res)
 		}
@@ -684,7 +684,7 @@ func TestReplacedLocalPartDetected(t *testing.T) {
 		t.Fatalf("unchanged re-ingest: %+v", r)
 	}
 	// as if sync had fetched it from Drive (with errors: nothing was ever staged)
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	arch, err := f.st.UpsertArchive(f.ctx, &store.Archive{AccountID: acct.ID, RemoteID: "drive-id", Name: name, ExportID: "20261006T035113Z-1", PartNo: 1, MD5: "abc", Status: store.ArchiveWithErrors})
 	if err != nil {
 		t.Fatal(err)
@@ -707,7 +707,7 @@ func TestReplacedLocalPartDetected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.ing.IngestPart(f.ctx, src, PartMeta{Account: "leo", ExportID: "20261006T035113Z-1", PartNo: 1, Name: name}, Options{Replace: true})
+	_, err = f.ing.IngestPart(f.ctx, src, PartMeta{Account: "alice", ExportID: "20261006T035113Z-1", PartNo: 1, Name: name}, Options{Replace: true})
 	src.Close()
 	if err == nil || !strings.Contains(err.Error(), "staged for deletion") {
 		t.Fatalf("local replace with a staged copy was not refused: %v", err)
@@ -728,11 +728,11 @@ func TestReplacedLocalPartDetected(t *testing.T) {
 	if !r.Replaced || r.Changed != 1 || r.Status != store.ArchiveIngested {
 		t.Fatalf("changed zip: %+v", r)
 	}
-	if !bytes.Equal(f.read("leo/library/2022/07/A.jpg"), b) {
+	if !bytes.Equal(f.read("alice/library/2022/07/A.jpg"), b) {
 		t.Error("changed bytes not current")
 	}
-	f.mustExist("leo/library/2022/07/A~v" + sha8(a) + ".jpg")
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	f.mustExist("alice/library/2022/07/A~v" + sha8(a) + ".jpg")
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -743,15 +743,15 @@ func TestOlderExportDoesNotRestorePrunedMembership(t *testing.T) {
 	f := newFixture(t)
 	a, b := randBytes(100), randBytes(110)
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
-	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{FullAlbums: true, Parts: 1})
-	if pres, err := f.ing.Prune(f.ctx, "leo", "20261106T000000Z-1", false); err != nil || pres.Skipped != "" {
+	if pres, err := f.ing.Prune(f.ctx, "alice", "20261106T000000Z-1", false); err != nil || pres.Skipped != "" {
 		t.Fatalf("prune: %+v %v", pres, err)
 	}
-	r := f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
@@ -761,16 +761,16 @@ func TestOlderExportDoesNotRestorePrunedMembership(t *testing.T) {
 	if r.Added != 1 || r.Links != 0 {
 		t.Fatalf("older export: %+v", r)
 	}
-	f.mustExist("leo/albums/Trip to Austin/A.jpg", "leo/library/2022/07/B.jpg")
-	if f.exists("leo/albums/Trip to Austin/B.jpg") {
+	f.mustExist("alice/albums/Trip to Austin/A.jpg", "alice/library/2022/07/B.jpg")
+	if f.exists("alice/albums/Trip to Austin/B.jpg") {
 		t.Error("older export recreated a membership the newer listing excluded")
 	}
 	// the excluded occurrence is history: it must not count as support later
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if o, _ := f.st.FindOccurrence(f.ctx, acct.ID, "20261006T000000Z-1", "Trip ", "B.jpg"); o == nil || o.Active {
 		t.Errorf("excluded album occurrence left active: %+v", o)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -781,7 +781,7 @@ func TestOlderExportDoesNotRestorePrunedMembership(t *testing.T) {
 func TestReplacedPartNonAuthoritativeUnlinks(t *testing.T) {
 	f := newFixture(t)
 	// an earlier export makes the next one non-authoritative
-	f.ingest("leo", f.zip("takeout-20261005T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261005T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/Z.jpg", randBytes(90)},
 		{gp + "Photos from 2022/Z.jpg.supplemental-metadata.json", sidecar("Z.jpg", "ZZZ", tJuly, "")},
 	}), Options{})
@@ -789,19 +789,19 @@ func TestReplacedPartNonAuthoritativeUnlinks(t *testing.T) {
 	name := "takeout-" + export + "-001.zip"
 	a, b := randBytes(100), randBytes(110)
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
-	f.ingest("leo", f.zip(name, []file{
+	f.ingest("alice", f.zip(name, []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 		{gp + "Trip /B.jpg", b},
 		{gp + "Trip /B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
-	f.mustExist("leo/albums/Trip to Austin/A.jpg", "leo/albums/Trip to Austin/B.jpg")
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	f.mustExist("alice/albums/Trip to Austin/A.jpg", "alice/albums/Trip to Austin/B.jpg")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if exp, _ := f.st.GetExport(f.ctx, acct.ID, export); exp.Authoritative {
 		t.Fatal("second export unexpectedly authoritative")
 	}
-	r := f.ingest("leo", f.zip(name, []file{
+	r := f.ingest("alice", f.zip(name, []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
@@ -809,11 +809,11 @@ func TestReplacedPartNonAuthoritativeUnlinks(t *testing.T) {
 	if !r.Replaced || r.Unlinked != 1 {
 		t.Fatalf("re-ingest: %+v", r)
 	}
-	if f.exists("leo/albums/Trip to Austin/B.jpg") {
+	if f.exists("alice/albums/Trip to Austin/B.jpg") {
 		t.Error("link of the dropped item survived")
 	}
-	f.mustExist("leo/albums/Trip to Austin/A.jpg", "leo/library/2022/07/B.jpg")
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	f.mustExist("alice/albums/Trip to Austin/A.jpg", "alice/library/2022/07/B.jpg")
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -824,14 +824,14 @@ func TestReplacedPartNonAuthoritativeUnlinks(t *testing.T) {
 func TestOlderExportDoesNotCreatePrunedAlbum(t *testing.T) {
 	f := newFixture(t)
 	a := randBytes(100)
-	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", a},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{FullAlbums: true, Parts: 1})
-	if pres, err := f.ing.Prune(f.ctx, "leo", "20261106T000000Z-1", false); err != nil || pres.Skipped != "" {
+	if pres, err := f.ing.Prune(f.ctx, "alice", "20261106T000000Z-1", false); err != nil || pres.Skipped != "" {
 		t.Fatalf("prune: %+v %v", pres, err)
 	}
-	r := f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Old Trip/metadata.json", []byte(`{"title": "Old Trip", "access": "protected", "date": {"timestamp": "1663091246"}}`)},
 		{gp + "Old Trip/A.jpg", a},
 		{gp + "Old Trip/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
@@ -839,11 +839,11 @@ func TestOlderExportDoesNotCreatePrunedAlbum(t *testing.T) {
 	if r.Links != 0 {
 		t.Fatalf("older export linked into an album the newer listing never had: %+v", r)
 	}
-	if f.exists("leo/albums/Old Trip/A.jpg") {
+	if f.exists("alice/albums/Old Trip/A.jpg") {
 		t.Error("stale album created by an older export")
 	}
-	f.mustExist("leo/library/2022/07/A.jpg")
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	f.mustExist("alice/library/2022/07/A.jpg")
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -854,29 +854,29 @@ func TestRenameFollowsAlbumLinks(t *testing.T) {
 	f := newFixture(t)
 	a := randBytes(100)
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", a},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{})
-	f.mustExist("leo/library/2022/07/A.jpg", "leo/albums/Trip to Austin/A.jpg")
-	r := f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	f.mustExist("alice/library/2022/07/A.jpg", "alice/albums/Trip to Austin/A.jpg")
+	r := f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", a},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("Austin skyline.jpg", "AAA", tJuly, "")},
 	}), Options{})
 	if r.Changed != 1 {
 		t.Fatalf("title change: %+v", r)
 	}
-	f.mustExist("leo/library/2022/07/Austin skyline.jpg", "leo/albums/Trip to Austin/Austin skyline.jpg")
-	if f.exists("leo/library/2022/07/A.jpg") || f.exists("leo/albums/Trip to Austin/A.jpg") {
+	f.mustExist("alice/library/2022/07/Austin skyline.jpg", "alice/albums/Trip to Austin/Austin skyline.jpg")
+	if f.exists("alice/library/2022/07/A.jpg") || f.exists("alice/albums/Trip to Austin/A.jpg") {
 		t.Error("old names left behind")
 	}
-	if !f.sameInode("leo/library/2022/07/Austin skyline.jpg", "leo/albums/Trip to Austin/Austin skyline.jpg") {
+	if !f.sameInode("alice/library/2022/07/Austin skyline.jpg", "alice/albums/Trip to Austin/Austin skyline.jpg") {
 		t.Error("renamed album link is not the item's inode")
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -890,14 +890,14 @@ func TestReconcileWaitsForReplacement(t *testing.T) {
 	name := "takeout-" + export + "-001.zip"
 	a, b := randBytes(100), randBytes(110)
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
-	f.ingest("leo", f.zip(name, []file{
+	f.ingest("alice", f.zip(name, []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 		{gp + "Trip /B.jpg", b},
 		{gp + "Trip /B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	arch, _ := f.st.GetArchive(f.ctx, acct.ID, export, 1)
 	// sync found a replacement on Drive: reset, then fetching
 	if err := f.st.ResetPartForReingest(f.ctx, arch.ID, acct.ID, export, 1); err != nil {
@@ -907,16 +907,16 @@ func TestReconcileWaitsForReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	// an unrelated part completes meanwhile
-	r := f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/Z.jpg", randBytes(90)},
 		{gp + "Photos from 2022/Z.jpg.supplemental-metadata.json", sidecar("Z.jpg", "ZZZ", tJuly, "")},
 	}), Options{})
 	if r.Unlinked != 0 {
 		t.Fatalf("unrelated part removed links of a replacement in progress: %+v", r)
 	}
-	f.mustExist("leo/albums/Trip to Austin/A.jpg", "leo/albums/Trip to Austin/B.jpg")
+	f.mustExist("alice/albums/Trip to Austin/A.jpg", "alice/albums/Trip to Austin/B.jpg")
 	// the replacement arrives without B
-	r = f.ingest("leo", f.zip(name, []file{
+	r = f.ingest("alice", f.zip(name, []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
@@ -924,11 +924,11 @@ func TestReconcileWaitsForReplacement(t *testing.T) {
 	if r.Unlinked != 1 || r.Status != store.ArchiveIngested {
 		t.Fatalf("replacement: %+v", r)
 	}
-	if f.exists("leo/albums/Trip to Austin/B.jpg") {
+	if f.exists("alice/albums/Trip to Austin/B.jpg") {
 		t.Error("link of the dropped item survived the replacement")
 	}
-	f.mustExist("leo/albums/Trip to Austin/A.jpg", "leo/library/2022/07/B.jpg")
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	f.mustExist("alice/albums/Trip to Austin/A.jpg", "alice/library/2022/07/B.jpg")
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -939,21 +939,21 @@ func TestReconcileWaitsForReplacement(t *testing.T) {
 func TestLateSidecarNeverTouchesItemsWithSidecar(t *testing.T) {
 	f := newFixture(t)
 	noID := []byte(fmt.Sprintf(`{"title":"A.jpg","description":"mine","photoTakenTime":{"timestamp":"%d"}}`, tJuly))
-	f.ingest("leo", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", randBytes(100)},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", noID},
 	}), Options{})
-	r := f.ingest("leo", f.zip("takeout-20261006T035113Z-1-002.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261006T035113Z-1-002.zip", []file{
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("A.jpg", "BBB", tMar, "")},
 	}), Options{})
 	if r.Promoted != 0 || r.Changed != 0 || r.PendingSidecars != 1 {
 		t.Fatalf("foreign sidecar touched an item that has its own: %+v", r)
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "BBB#original"); it != nil {
 		t.Error("A.jpg was promoted under B's Google id")
 	}
-	if !bytes.Contains(f.read("leo/library/2022/07/A.jpg.json"), []byte(`"mine"`)) {
+	if !bytes.Contains(f.read("alice/library/2022/07/A.jpg.json"), []byte(`"mine"`)) {
 		t.Error("A.jpg's own sidecar was replaced")
 	}
 }
@@ -966,7 +966,7 @@ func TestReconcileIgnoresPrunedOccurrencesOfPartialParts(t *testing.T) {
 	a, b := randBytes(100), randBytes(110)
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
 	// export D stays partial (truncated) and lists B in the album
-	r := f.ingest("leo", f.zip("takeout-20261005T000000Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261005T000000Z-1-001.zip", []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /B.jpg", b},
 		{gp + "Trip /B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
@@ -976,37 +976,37 @@ func TestReconcileIgnoresPrunedOccurrencesOfPartialParts(t *testing.T) {
 	if r.Status != store.ArchivePartial {
 		t.Fatalf("export D: %+v", r)
 	}
-	f.mustExist("leo/albums/Trip to Austin/B.jpg")
+	f.mustExist("alice/albums/Trip to Austin/B.jpg")
 	// export E's complete listing has only A: B's membership is pruned
-	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{FullAlbums: true, Parts: 1})
-	if pres, err := f.ing.Prune(f.ctx, "leo", "20261106T000000Z-1", false); err != nil || pres.Removed != 1 {
+	if pres, err := f.ing.Prune(f.ctx, "alice", "20261106T000000Z-1", false); err != nil || pres.Removed != 1 {
 		t.Fatalf("prune: %+v %v", pres, err)
 	}
 	// export F (non-authoritative) lists B again, then its part is replaced without B
 	const fexp = "20261206T000000Z-1"
 	fname := "takeout-" + fexp + "-001.zip"
-	f.ingest("leo", f.zip(fname, []file{
+	f.ingest("alice", f.zip(fname, []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 		{gp + "Trip /B.jpg", b},
 		{gp + "Trip /B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
-	f.mustExist("leo/albums/Trip to Austin/B.jpg")
-	r = f.ingest("leo", f.zip(fname, []file{
+	f.mustExist("alice/albums/Trip to Austin/B.jpg")
+	r = f.ingest("alice", f.zip(fname, []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{Replace: true})
-	if r.Unlinked != 1 || f.exists("leo/albums/Trip to Austin/B.jpg") {
+	if r.Unlinked != 1 || f.exists("alice/albums/Trip to Austin/B.jpg") {
 		t.Fatalf("stale link kept alive by a pruned occurrence of a partial part: %+v", r)
 	}
-	f.mustExist("leo/albums/Trip to Austin/A.jpg", "leo/library/2022/07/B.jpg")
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	f.mustExist("alice/albums/Trip to Austin/A.jpg", "alice/library/2022/07/B.jpg")
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1017,30 +1017,30 @@ func TestReplacedPartCorrectsCrossPartSidecar(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261006T035113Z-1"
 	p1 := "takeout-" + export + "-001.zip"
-	f.ingest("leo", f.zip(p1, []file{
+	f.ingest("alice", f.zip(p1, []file{
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, `,"description":"old"`)},
 	}), Options{})
-	f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{
 		{gp + "Photos from 2022/A.jpg", randBytes(100)},
 	}), Options{})
-	if !bytes.Contains(f.read("leo/library/2022/07/A.jpg.json"), []byte(`"old"`)) {
+	if !bytes.Contains(f.read("alice/library/2022/07/A.jpg.json"), []byte(`"old"`)) {
 		t.Fatal("pending sidecar not applied by part 2")
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original")
 	if sc, _ := f.st.GetSidecar(f.ctx, it.ID); sc == nil || sc.PartNo != 1 {
 		t.Fatalf("stored sidecar does not record part 1 as its source: %+v", sc)
 	}
-	r := f.ingest("leo", f.zip(p1, []file{
+	r := f.ingest("alice", f.zip(p1, []file{
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, `,"description":"corrected"`)},
 	}), Options{Replace: true})
 	if !r.Replaced || r.PendingSidecars != 0 {
 		t.Fatalf("replacement of part 1: %+v", r)
 	}
-	if !bytes.Contains(f.read("leo/library/2022/07/A.jpg.json"), []byte(`"corrected"`)) {
+	if !bytes.Contains(f.read("alice/library/2022/07/A.jpg.json"), []byte(`"corrected"`)) {
 		t.Error("corrected sidecar from the replaced part not applied")
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1051,18 +1051,18 @@ func TestPromotionKeepsNewerStoredSidecar(t *testing.T) {
 	f := newFixture(t)
 	x := randBytes(100)
 	noID := []byte(fmt.Sprintf(`{"title":"X.jpg","description":"newer","photoTakenTime":{"timestamp":"%d"}}`, tJuly))
-	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", x},
 		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", noID},
 	}), Options{})
-	r := f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", x},
 		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, `,"description":"older"`)},
 	}), Options{})
 	if r.Promoted != 1 {
 		t.Fatalf("older export: %+v", r)
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "XXX#original")
 	if it == nil {
 		t.Fatal("identity from the older export not applied")
@@ -1074,7 +1074,7 @@ func TestPromotionKeepsNewerStoredSidecar(t *testing.T) {
 	if !bytes.Contains(f.read(it.LibPath+".json"), []byte(`"newer"`)) {
 		t.Error("sidecar file does not hold the newer metadata")
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1086,22 +1086,22 @@ func TestReplacedPartReleasesOrphanedSidecars(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261006T035113Z-1"
 	p1 := "takeout-" + export + "-001.zip"
-	f.ingest("leo", f.zip(p1, []file{
+	f.ingest("alice", f.zip(p1, []file{
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, `,"description":"from part 1"`)},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
-	f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{
 		{gp + "Photos from 2022/A.jpg", randBytes(100)},
 		{gp + "Photos from 2022/B.jpg", randBytes(110)},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	a, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original")
 	b, _ := f.st.FindItemByKey(f.ctx, acct.ID, "BBB#original")
 	if a == nil || b == nil {
 		t.Fatal("pending sidecars not applied by part 2")
 	}
 	// the replacement of part 1 keeps B's sidecar but drops A's
-	r := f.ingest("leo", f.zip(p1, []file{
+	r := f.ingest("alice", f.zip(p1, []file{
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{Replace: true})
 	if !r.Replaced || r.SidecarsOrphaned != 1 {
@@ -1115,11 +1115,11 @@ func TestReplacedPartReleasesOrphanedSidecars(t *testing.T) {
 	if sb == nil || sb.ExportID != export || sb.PartNo != 1 {
 		t.Errorf("confirmed sidecar lost its provenance: %+v", sb)
 	}
-	f.mustExist("leo/library/2022/07/A.jpg.json")
+	f.mustExist("alice/library/2022/07/A.jpg.json")
 	// a later export resending the photo with its sidecar replaces the orphaned
 	// one (unknown provenance never wins)
-	r = f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
-		{gp + "Photos from 2022/A.jpg", f.read("leo/library/2022/07/A.jpg")},
+	r = f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+		{gp + "Photos from 2022/A.jpg", f.read("alice/library/2022/07/A.jpg")},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, `,"description":"resent"`)},
 	}), Options{})
 	if r.Failed != 0 {
@@ -1128,7 +1128,7 @@ func TestReplacedPartReleasesOrphanedSidecars(t *testing.T) {
 	if sa, _ = f.st.GetSidecar(f.ctx, a.ID); sa == nil || !bytes.Contains(sa.JSON, []byte("resent")) || sa.ExportID != "20261106T000000Z-1" {
 		t.Errorf("orphaned sidecar not replaced by a later exact one: %+v", sa)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1141,36 +1141,36 @@ func TestLateSidecarReachesPrunedAlbumOccurrence(t *testing.T) {
 	a := randBytes(100)
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
 	// export C part 1: the photo only in the album, without its sidecar
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /A.jpg", a},
 	}), Options{})
-	f.mustExist("leo/albums/Trip to Austin/A.jpg")
+	f.mustExist("alice/albums/Trip to Austin/A.jpg")
 	// export D's complete listing no longer has it: membership withdrawn
-	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /Z.jpg", randBytes(90)},
 		{gp + "Trip /Z.jpg.supplemental-metadata.json", sidecar("Z.jpg", "ZZZ", tJuly, "")},
 	}), Options{FullAlbums: true, Parts: 1})
-	if pres, err := f.ing.Prune(f.ctx, "leo", "20261106T000000Z-1", false); err != nil || pres.Removed != 1 {
+	if pres, err := f.ing.Prune(f.ctx, "alice", "20261106T000000Z-1", false); err != nil || pres.Removed != 1 {
 		t.Fatalf("prune: %+v %v", pres, err)
 	}
 	// export C part 2 arrives late with the sidecar
-	r := f.ingest("leo", f.zip("takeout-20261006T000000Z-1-002.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261006T000000Z-1-002.zip", []file{
 		{gp + "Trip /A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{})
 	if r.Promoted != 1 || r.PendingSidecars != 0 || r.Links != 0 {
 		t.Fatalf("late sidecar for a pruned occurrence: %+v", r)
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original"); it == nil {
 		t.Fatal("identity not applied")
 	}
-	f.mustExist("leo/library/2022/07/A.jpg", "leo/library/2022/07/A.jpg.json")
-	if f.exists("leo/albums/Trip to Austin/A.jpg") {
+	f.mustExist("alice/library/2022/07/A.jpg", "alice/library/2022/07/A.jpg.json")
+	if f.exists("alice/albums/Trip to Austin/A.jpg") {
 		t.Error("withdrawn album link recreated by the late sidecar")
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1184,9 +1184,9 @@ func TestOlderExportDoesNotConfirmReplacedPartSidecar(t *testing.T) {
 	p1 := "takeout-" + export + "-001.zip"
 	a := randBytes(100)
 	sc := sidecar("A.jpg", "AAA", tJuly, `,"description":"same"`)
-	f.ingest("leo", f.zip(p1, []file{{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sc}}), Options{})
-	f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Photos from 2022/A.jpg", a}}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	f.ingest("alice", f.zip(p1, []file{{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sc}}), Options{})
+	f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Photos from 2022/A.jpg", a}}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	arch, _ := f.st.GetArchive(f.ctx, acct.ID, export, 1)
 	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original")
 	// sync found part 1 replaced: pending re-ingest
@@ -1197,7 +1197,7 @@ func TestOlderExportDoesNotConfirmReplacedPartSidecar(t *testing.T) {
 		t.Fatalf("sidecar of the replaced part not awaiting confirmation: %+v", row)
 	}
 	// an older export delivers the photo with the identical sidecar meanwhile
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", a},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sc},
 	}), Options{})
@@ -1205,7 +1205,7 @@ func TestOlderExportDoesNotConfirmReplacedPartSidecar(t *testing.T) {
 		t.Fatalf("older export confirmed or took over the sidecar: %+v", row)
 	}
 	// the replacement arrives without the sidecar: provenance released
-	r := f.ingest("leo", f.zip(p1, []file{{gp + "Photos from 2022/Other.jpg.supplemental-metadata.json", sidecar("Other.jpg", "OOO", tJuly, "")}}), Options{})
+	r := f.ingest("alice", f.zip(p1, []file{{gp + "Photos from 2022/Other.jpg.supplemental-metadata.json", sidecar("Other.jpg", "OOO", tJuly, "")}}), Options{})
 	if r.SidecarsOrphaned != 1 {
 		t.Fatalf("replacement: %+v", r)
 	}
@@ -1222,26 +1222,26 @@ func TestReplacementMovingMediaToLaterPartKeepsSidecarPending(t *testing.T) {
 	const export = "20261006T035113Z-1"
 	p1 := "takeout-" + export + "-001.zip"
 	a := randBytes(100)
-	f.ingest("leo", f.zip(p1, []file{
+	f.ingest("alice", f.zip(p1, []file{
 		{gp + "Photos from 2022/A.jpg", a},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{})
-	r := f.ingest("leo", f.zip(p1, []file{
+	r := f.ingest("alice", f.zip(p1, []file{
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, `,"description":"corrected"`)},
 	}), Options{Replace: true})
 	if !r.Replaced || r.PendingSidecars != 1 {
 		t.Fatalf("replacement without the media: %+v", r)
 	}
-	r = f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Photos from 2022/A.jpg", a}}), Options{})
+	r = f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Photos from 2022/A.jpg", a}}), Options{})
 	if r.Changed != 1 {
 		t.Fatalf("media in the later part: %+v", r)
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original")
 	if sc, _ := f.st.GetSidecar(f.ctx, it.ID); sc == nil || !bytes.Contains(sc.JSON, []byte("corrected")) || sc.PartNo != 1 {
 		t.Errorf("corrected sidecar not applied via pending: %+v", sc)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1253,17 +1253,17 @@ func TestMergeKeepsNewerFallbackSidecar(t *testing.T) {
 	f := newFixture(t)
 	x := randBytes(100)
 	// the identity holder, from an older export, with its own sidecar
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", x},
 		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, `,"description":"older"`)},
 	}), Options{})
 	// a newer export: same photo under another name, sidecar without a Google id
 	noID := []byte(fmt.Sprintf(`{"title":"X2.jpg","description":"newer","photoTakenTime":{"timestamp":"%d"}}`, tJuly))
-	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X2.jpg", x},
 		{gp + "Photos from 2022/X2.jpg.supplemental-metadata.json", noID},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	fb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "occ:20261106T000000Z-1#Photos from 2022#X2.jpg")
 	if fb == nil {
 		t.Fatal("fallback item not found")
@@ -1274,7 +1274,7 @@ func TestMergeKeepsNewerFallbackSidecar(t *testing.T) {
 		t.Fatal(err)
 	}
 	// a delayed part of the older export identifies the fallback: promotion merges it
-	pr := &partRun{ing: f.ing, ctx: f.ctx, acct: acct, part: PartMeta{Account: "leo", ExportID: "20261006T000000Z-1", PartNo: 2, Name: "takeout-20261006T000000Z-1-002.zip"}, folders: map[string]*folderCtx{}}
+	pr := &partRun{ing: f.ing, ctx: f.ctx, acct: acct, part: PartMeta{Account: "alice", ExportID: "20261006T000000Z-1", PartNo: 2, Name: "takeout-20261006T000000Z-1-002.zip"}, folders: map[string]*folderCtx{}}
 	arriving, err := takeoutParse(sidecar("X2.jpg", "XXX", tJuly, `,"description":"older too"`))
 	if err != nil {
 		t.Fatal(err)
@@ -1293,7 +1293,7 @@ func TestMergeKeepsNewerFallbackSidecar(t *testing.T) {
 	if c, _ := f.st.Counts(f.ctx, acct.ID); c["items"] != 1 {
 		t.Errorf("items after merge: %d", c["items"])
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1306,19 +1306,19 @@ func TestRemovedEntryDoesNotTakeLaterSidecar(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261006T035113Z-1"
 	p1 := "takeout-" + export + "-001.zip"
-	f.ingest("leo", f.zip(p1, []file{{gp + "Photos from 2022/A.jpg", randBytes(100)}}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	f.ingest("alice", f.zip(p1, []file{{gp + "Photos from 2022/A.jpg", randBytes(100)}}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	removed, _ := f.st.FindItemByKey(f.ctx, acct.ID, "occ:"+export+"#Photos from 2022#A.jpg")
 	if removed == nil {
 		t.Fatal("fallback item not found")
 	}
 	// the replacement no longer carries A.jpg
-	r := f.ingest("leo", f.zip(p1, []file{{gp + "Photos from 2022/Z.jpg", randBytes(90)}}), Options{Replace: true})
+	r := f.ingest("alice", f.zip(p1, []file{{gp + "Photos from 2022/Z.jpg", randBytes(90)}}), Options{Replace: true})
 	if !r.Replaced {
 		t.Fatalf("replacement: %+v", r)
 	}
 	// a later part brings a sidecar named for A.jpg: not for the removed photo
-	r = f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{})
 	if r.Promoted != 0 || r.PendingSidecars != 1 {
@@ -1340,13 +1340,13 @@ func TestMergePrefersConfirmedTargetSidecar(t *testing.T) {
 	x := randBytes(100)
 	const export = "20261106T000000Z-1"
 	noID := []byte(fmt.Sprintf(`{"title":"X2.jpg","description":"fallback copy","photoTakenTime":{"timestamp":"%d"}}`, tJuly))
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", x},
 		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, `,"description":"confirmed"`)},
 		{gp + "Photos from 2022/X2.jpg", x},
 		{gp + "Photos from 2022/X2.jpg.supplemental-metadata.json", noID},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	target, _ := f.st.FindItemByKey(f.ctx, acct.ID, "XXX#original")
 	fb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "occ:"+export+"#Photos from 2022#X2.jpg")
 	arch, _ := f.st.GetArchive(f.ctx, acct.ID, export, 1)
@@ -1358,7 +1358,7 @@ func TestMergePrefersConfirmedTargetSidecar(t *testing.T) {
 	if err := f.st.SetSidecarExport(f.ctx, target.ID, export, 2); err != nil {
 		t.Fatal(err)
 	}
-	pr := &partRun{ing: f.ing, ctx: f.ctx, acct: acct, part: PartMeta{Account: "leo", ExportID: "20261006T000000Z-1", PartNo: 2, Name: "takeout-20261006T000000Z-1-002.zip"}, folders: map[string]*folderCtx{}}
+	pr := &partRun{ing: f.ing, ctx: f.ctx, acct: acct, part: PartMeta{Account: "alice", ExportID: "20261006T000000Z-1", PartNo: 2, Name: "takeout-20261006T000000Z-1-002.zip"}, folders: map[string]*folderCtx{}}
 	arriving, _ := takeoutParse(sidecar("X2.jpg", "XXX", tJuly, `,"description":"older"`))
 	if _, err := pr.promote(fb, arriving, "original", "XXX", "XXX#original"); err != nil {
 		t.Fatal(err)
@@ -1378,7 +1378,7 @@ func TestSidecarOnlyAlbumEntriesBecomeLinks(t *testing.T) {
 	meta := []byte(`{"title": "Serbia 2025", "access": "protected", "date": {"timestamp": "1663091246"}}`)
 	a, b := randBytes(100), randBytes(110)
 	// part 1: A in its year folder; the album carries only A's and B's sidecars
-	r := f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", a},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 		{gp + "Serbia 2025/metadata.json", meta},
@@ -1388,20 +1388,20 @@ func TestSidecarOnlyAlbumEntriesBecomeLinks(t *testing.T) {
 	if r.SidecarLinks != 1 {
 		t.Fatalf("part 1: %+v", r)
 	}
-	f.mustExist("leo/albums/Serbia 2025/A.jpg")
-	if !f.sameInode("leo/albums/Serbia 2025/A.jpg", "leo/library/2022/07/A.jpg") {
+	f.mustExist("alice/albums/Serbia 2025/A.jpg")
+	if !f.sameInode("alice/albums/Serbia 2025/A.jpg", "alice/library/2022/07/A.jpg") {
 		t.Error("album link is not the photo's inode")
 	}
 	// part 2 brings B in its year folder: the album link follows
-	r = f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{
 		{gp + "Photos from 2022/B.jpg", b},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
 	if r.SidecarLinks != 1 {
 		t.Fatalf("part 2: %+v", r)
 	}
-	f.mustExist("leo/albums/Serbia 2025/B.jpg")
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	f.mustExist("alice/albums/Serbia 2025/B.jpg")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 {
 		t.Errorf("pending sidecars left: %d", n)
 	}
@@ -1409,10 +1409,10 @@ func TestSidecarOnlyAlbumEntriesBecomeLinks(t *testing.T) {
 	if err := f.st.SetExportConfirmedParts(f.ctx, acct.ID, export, 2, true); err != nil {
 		t.Fatal(err)
 	}
-	if pres, err := f.ing.Prune(f.ctx, "leo", export, false); err != nil || pres.Skipped != "" || pres.Removed != 0 {
+	if pres, err := f.ing.Prune(f.ctx, "alice", export, false); err != nil || pres.Skipped != "" || pres.Removed != 0 {
 		t.Fatalf("prune: %+v %v", pres, err)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1421,27 +1421,27 @@ func TestSidecarOnlyAlbumEntriesBecomeLinks(t *testing.T) {
 // describes that photo.
 func TestSidecarNamedWithoutExtension(t *testing.T) {
 	f := newFixture(t)
-	r := f.ingest("leo", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
 		{gp + "Photos from 2012/11_16_12 - 1.jpg", randBytes(100)},
 		{gp + "Photos from 2012/11_16_12 - 1.json", sidecar("11/16/12 - 1", "AAA", tJuly, "")},
 	}), Options{})
 	if r.Added != 1 || r.PendingSidecars != 0 {
 		t.Fatalf("ingest: %+v", r)
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original")
 	if it == nil {
 		t.Fatal("photo did not get its sidecar's identity")
 	}
 	f.mustExist(it.LibPath + ".json")
 	// the pending store resolves the same way when the sidecar came in an earlier part
-	r = f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2013/New Year - 1.json", sidecar("New Year - 1", "NNN", tJuly, "")},
 	}), Options{})
 	if r.PendingSidecars != 1 {
 		t.Fatalf("sidecar-only part: %+v", r)
 	}
-	r = f.ingest("leo", f.zip("takeout-20261106T000000Z-1-002.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-20261106T000000Z-1-002.zip", []file{
 		{gp + "Photos from 2013/New Year - 1.jpg", randBytes(90)},
 	}), Options{})
 	if it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "NNN#original"); it == nil {
@@ -1451,7 +1451,7 @@ func TestSidecarNamedWithoutExtension(t *testing.T) {
 		t.Errorf("resolved stem sidecar still counted as pending: %d", n)
 	}
 	// an edited file keeps its variant under this rule
-	r = f.ingest("leo", f.zip("takeout-20261206T000000Z-1-001.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-20261206T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2014/Trip - 2-edited.jpg", randBytes(80)},
 		{gp + "Photos from 2014/Trip - 2-edited.json", sidecar("Trip - 2", "EEE", tJuly, "")},
 	}), Options{})
@@ -1467,7 +1467,7 @@ func TestSidecarNamedWithoutExtension(t *testing.T) {
 	} {
 		exp := fmt.Sprintf("2027010%dT000000Z-1", i+1)
 		gid, year := fmt.Sprintf("PPP%d", i), 2015+i
-		r = f.ingest("leo", f.zip("takeout-"+exp+"-001.zip", append(order,
+		r = f.ingest("alice", f.zip("takeout-"+exp+"-001.zip", append(order,
 			file{fmt.Sprintf("%sPhotos from %d/Pair - %d.json", gp, year, i+1), sidecar(fmt.Sprintf("Pair - %d", i+1), gid, tJuly, "")})), Options{})
 		still, _ := f.st.FindItemByKey(f.ctx, acct.ID, gid+"#original")
 		video, _ := f.st.FindItemByKey(f.ctx, acct.ID, gid+"#motion")
@@ -1476,7 +1476,7 @@ func TestSidecarNamedWithoutExtension(t *testing.T) {
 		}
 	}
 	// a lone video is the original
-	r = f.ingest("leo", f.zip("takeout-20270301T000000Z-1-001.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-20270301T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2017/Clip - 1.mp4", randBytes(60)},
 		{gp + "Photos from 2017/Clip - 1.json", sidecar("Clip - 1", "VVV", tJuly, "")},
 	}), Options{})
@@ -1497,7 +1497,7 @@ func TestSidecarNamedWithoutExtension(t *testing.T) {
 			parts = [][]file{{sc}, order}
 		}
 		for n, files := range parts {
-			r = f.ingest("leo", f.zip(fmt.Sprintf("takeout-%s-00%d.zip", exp, n+1), files), Options{})
+			r = f.ingest("alice", f.zip(fmt.Sprintf("takeout-%s-00%d.zip", exp, n+1), files), Options{})
 		}
 		still, _ := f.st.FindItemByKey(f.ctx, acct.ID, gid+"#original")
 		video, _ := f.st.FindItemByKey(f.ctx, acct.ID, gid+"#motion")
@@ -1525,7 +1525,7 @@ func TestSidecarNamedWithoutExtension(t *testing.T) {
 		exp := fmt.Sprintf("2027070%dT000000Z-1", i+1)
 		gid := fmt.Sprintf("SSS%d", i)
 		for n, files := range parts {
-			r = f.ingest("leo", f.zip(fmt.Sprintf("takeout-%s-00%d.zip", exp, n+1), files), Options{})
+			r = f.ingest("alice", f.zip(fmt.Sprintf("takeout-%s-00%d.zip", exp, n+1), files), Options{})
 			if n == 1 {
 				if v, _ := f.st.FindItemByKey(f.ctx, acct.ID, gid+"#original"); v == nil || v.Ext != ".mp4" {
 					t.Errorf("lone video %d not the original before its still: %+v", i, v)
@@ -1551,7 +1551,7 @@ func TestSidecarNamedWithoutExtension(t *testing.T) {
 		exp := fmt.Sprintf("2027090%dT000000Z-1", i+1)
 		gid := fmt.Sprintf("PP%d", 7+i)
 		for n, files := range parts {
-			r = f.ingest("leo", f.zip(fmt.Sprintf("takeout-%s-00%d.zip", exp, n+1), files), Options{})
+			r = f.ingest("alice", f.zip(fmt.Sprintf("takeout-%s-00%d.zip", exp, n+1), files), Options{})
 		}
 		still, _ := f.st.FindItemByKey(f.ctx, acct.ID, gid+"#original")
 		video, _ := f.st.FindItemByKey(f.ctx, acct.ID, gid+"#motion")
@@ -1563,17 +1563,17 @@ func TestSidecarNamedWithoutExtension(t *testing.T) {
 		}
 	}
 	// and a video arriving after its still, with the sidecar between the two
-	f.ingest("leo", f.zip("takeout-20270801T000000Z-1-001.zip", []file{{gp + "Photos from 2026/Late - 9.jpg", randBytes(65)}}), Options{})
-	f.ingest("leo", f.zip("takeout-20270801T000000Z-1-002.zip", []file{{gp + "Photos from 2026/Late - 9.json", sidecar("Late - 9", "LL9", tJuly, "")}}), Options{})
-	r = f.ingest("leo", f.zip("takeout-20270801T000000Z-1-003.zip", []file{{gp + "Photos from 2026/Late - 9.mp4", randBytes(66)}}), Options{})
+	f.ingest("alice", f.zip("takeout-20270801T000000Z-1-001.zip", []file{{gp + "Photos from 2026/Late - 9.jpg", randBytes(65)}}), Options{})
+	f.ingest("alice", f.zip("takeout-20270801T000000Z-1-002.zip", []file{{gp + "Photos from 2026/Late - 9.json", sidecar("Late - 9", "LL9", tJuly, "")}}), Options{})
+	r = f.ingest("alice", f.zip("takeout-20270801T000000Z-1-003.zip", []file{{gp + "Photos from 2026/Late - 9.mp4", randBytes(66)}}), Options{})
 	if video, _ := f.st.FindItemByKey(f.ctx, acct.ID, "LL9#motion"); video == nil || video.Ext != ".mp4" || r.Added != 1 {
 		t.Errorf("video after its still and sidecar: video=%+v %+v", video, r)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 	// two stills sharing the stem: ambiguous, the sidecar waits
-	r = f.ingest("leo", f.zip("takeout-20270401T000000Z-1-001.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-20270401T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2018/Dup - 1.jpg", randBytes(61)},
 		{gp + "Photos from 2018/Dup - 1.png", randBytes(62)},
 		{gp + "Photos from 2018/Dup - 1.json", sidecar("Dup - 1", "DDD", tJuly, "")},
@@ -1582,10 +1582,10 @@ func TestSidecarNamedWithoutExtension(t *testing.T) {
 		t.Errorf("ambiguous title-only sidecar was applied: %+v", r)
 	}
 	// the same two stills with the sidecar arriving first: the pending path is as careful
-	f.ingest("leo", f.zip("takeout-20270501T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20270501T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2019/Dup - 2.json", sidecar("Dup - 2", "DD2", tJuly, "")},
 	}), Options{})
-	r = f.ingest("leo", f.zip("takeout-20270501T000000Z-1-002.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-20270501T000000Z-1-002.zip", []file{
 		{gp + "Photos from 2019/Dup - 2.jpg", randBytes(63)},
 		{gp + "Photos from 2019/Dup - 2.png", randBytes(64)},
 	}), Options{})
@@ -1599,7 +1599,7 @@ func TestSidecarNamedWithoutExtension(t *testing.T) {
 func TestSidecarOnlyEntriesFollowTheExportsAlbum(t *testing.T) {
 	f := newFixture(t)
 	a, b := randBytes(100), randBytes(110)
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", a},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 		{gp + "Photos from 2022/B.jpg", b},
@@ -1610,34 +1610,34 @@ func TestSidecarOnlyEntriesFollowTheExportsAlbum(t *testing.T) {
 	}), Options{})
 	// a later export: the same folder name now is another album (other title and
 	// date) holding only B's sidecar
-	r := f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Trip/metadata.json", []byte(`{"title": "Trip 2023", "access": "protected", "date": {"timestamp": "1694627246"}}`)},
 		{gp + "Trip/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
 	if r.SidecarLinks != 1 {
 		t.Fatalf("later export: %+v", r)
 	}
-	f.mustExist("leo/albums/Trip 2022/A.jpg", "leo/albums/Trip 2023/B.jpg")
-	if f.exists("leo/albums/Trip 2022/B.jpg") {
+	f.mustExist("alice/albums/Trip 2022/A.jpg", "alice/albums/Trip 2023/B.jpg")
+	if f.exists("alice/albums/Trip 2022/B.jpg") {
 		t.Error("sidecar-only entry linked into the older album of the same folder name")
 	}
 	// a later part of that export has media in the folder but no metadata: the
 	// recorded album still wins, for its media and for later sidecar-only entries
 	c := randBytes(120)
-	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-002.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261106T000000Z-1-002.zip", []file{
 		{gp + "Trip/C.jpg", c},
 		{gp + "Trip/C.jpg.supplemental-metadata.json", sidecar("C.jpg", "CCC", tJuly, "")},
 	}), Options{})
-	f.ingest("leo", f.zip("takeout-20261106T000000Z-1-003.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261106T000000Z-1-003.zip", []file{
 		{gp + "Photos from 2022/D.jpg", randBytes(130)},
 		{gp + "Photos from 2022/D.jpg.supplemental-metadata.json", sidecar("D.jpg", "DDD", tJuly, "")},
 		{gp + "Trip/D.jpg.supplemental-metadata.json", sidecar("D.jpg", "DDD", tJuly, "")},
 	}), Options{})
-	f.mustExist("leo/albums/Trip 2023/C.jpg", "leo/albums/Trip 2023/D.jpg")
-	if f.exists("leo/albums/Trip 2022/C.jpg") || f.exists("leo/albums/Trip 2022/D.jpg") {
+	f.mustExist("alice/albums/Trip 2023/C.jpg", "alice/albums/Trip 2023/D.jpg")
+	if f.exists("alice/albums/Trip 2022/C.jpg") || f.exists("alice/albums/Trip 2022/D.jpg") {
 		t.Error("a part without metadata re-attached the folder to the older album")
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1646,7 +1646,7 @@ func TestSidecarOnlyEntriesFollowTheExportsAlbum(t *testing.T) {
 // stored as pending.
 func TestExcludedFolderSidecarsNotPending(t *testing.T) {
 	f := newFixture(t)
-	r := f.ingest("leo", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
 		{gp + "Trash/T.jpg", randBytes(100)},
 		{gp + "Trash/T.jpg.supplemental-metadata.json", sidecar("T.jpg", "TTT", tJuly, "")},
 		{gp + "Photos from 2022/A.jpg", randBytes(100)},
@@ -1662,7 +1662,7 @@ func TestExcludedFolderSidecarsNotPending(t *testing.T) {
 func TestTitleOnlySidecarAloneInAlbumLinks(t *testing.T) {
 	f := newFixture(t)
 	a := randBytes(100)
-	r := f.ingest("leo", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", a},
 		{gp + "Photos from 2022/A.json", sidecar("A", "AAA", tJuly, "")},
 		{gp + "Trip /metadata.json", []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)},
@@ -1671,8 +1671,8 @@ func TestTitleOnlySidecarAloneInAlbumLinks(t *testing.T) {
 	if r.SidecarLinks != 1 {
 		t.Fatalf("title-only album entry: %+v", r)
 	}
-	f.mustExist("leo/albums/Trip to Austin/A.jpg")
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	f.mustExist("alice/albums/Trip to Austin/A.jpg")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 {
 		t.Errorf("resolved album entry still counted as waiting: %d", n)
 	}
@@ -1684,13 +1684,13 @@ func TestTitleOnlySidecarAloneInAlbumLinks(t *testing.T) {
 func TestTitleOnlySidecarNotReusedAcrossParts(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261006T035113Z-1"
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{{gp + "Photos from 2022/X.json", sidecar("X", "XXX", tJuly, "")}}), Options{})
-	f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Photos from 2022/X.jpg", randBytes(70)}}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{{gp + "Photos from 2022/X.json", sidecar("X", "XXX", tJuly, "")}}), Options{})
+	f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Photos from 2022/X.jpg", randBytes(70)}}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "XXX#original"); it == nil || it.Ext != ".jpg" {
 		t.Fatalf("first file not matched: %+v", it)
 	}
-	r := f.ingest("leo", f.zip("takeout-"+export+"-003.zip", []file{{gp + "Photos from 2022/X.png", randBytes(71)}}), Options{})
+	r := f.ingest("alice", f.zip("takeout-"+export+"-003.zip", []file{{gp + "Photos from 2022/X.png", randBytes(71)}}), Options{})
 	if r.Added != 1 {
 		t.Fatalf("third part: %+v", r)
 	}
@@ -1705,11 +1705,11 @@ func TestTitleOnlySidecarNotReusedAcrossParts(t *testing.T) {
 // A title may contain dots: X.Y.json beside X.Y.jpg describes that photo.
 func TestTitleWithDots(t *testing.T) {
 	f := newFixture(t)
-	r := f.ingest("leo", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.Y.jpg", randBytes(70)},
 		{gp + "Photos from 2022/X.Y.json", sidecar("X.Y", "XY1", tJuly, "")},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "XY1#original"); it == nil || r.PendingSidecars != 0 {
 		t.Errorf("dotted title not matched: %+v", r)
 	}
@@ -1721,18 +1721,18 @@ func TestTitleWithDots(t *testing.T) {
 func TestLaterMetadataMovesFolderToItsAlbum(t *testing.T) {
 	f := newFixture(t)
 	a, c := randBytes(100), randBytes(120)
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Trip/metadata.json", []byte(`{"title": "Trip 2022", "access": "protected", "date": {"timestamp": "1663091246"}}`)},
 		{gp + "Trip/A.jpg", a},
 		{gp + "Trip/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{})
 	const export = "20261106T000000Z-1"
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Trip/C.jpg", c},
 		{gp + "Trip/C.jpg.supplemental-metadata.json", sidecar("C.jpg", "CCC", tJuly, "")},
 	}), Options{})
-	f.mustExist("leo/albums/Trip 2022/C.jpg") // the guess by folder name
-	r := f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+	f.mustExist("alice/albums/Trip 2022/C.jpg") // the guess by folder name
+	r := f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{
 		{gp + "Trip/metadata.json", []byte(`{"title": "Trip 2023", "access": "protected", "date": {"timestamp": "1694627246"}}`)},
 		{gp + "Trip/D.jpg", randBytes(130)},
 		{gp + "Trip/D.jpg.supplemental-metadata.json", sidecar("D.jpg", "DDD", tJuly, "")},
@@ -1740,11 +1740,11 @@ func TestLaterMetadataMovesFolderToItsAlbum(t *testing.T) {
 	if r.Status != store.ArchiveIngested {
 		t.Fatalf("part with metadata: %+v", r)
 	}
-	f.mustExist("leo/albums/Trip 2023/C.jpg", "leo/albums/Trip 2023/D.jpg", "leo/albums/Trip 2022/A.jpg")
-	if f.exists("leo/albums/Trip 2022/C.jpg") {
+	f.mustExist("alice/albums/Trip 2023/C.jpg", "alice/albums/Trip 2023/D.jpg", "alice/albums/Trip 2022/A.jpg")
+	if f.exists("alice/albums/Trip 2022/C.jpg") {
 		t.Error("the guessed membership in the older album survived")
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1755,12 +1755,12 @@ func TestLaterMetadataMovesFolderToItsAlbum(t *testing.T) {
 func TestLateTitleSidecarAmbiguousAcrossParts(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261006T035113Z-1"
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", randBytes(70)},
 		{gp + "Photos from 2022/X.png", randBytes(71)},
 	}), Options{})
-	r := f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Photos from 2022/X.json", sidecar("X", "XXX", tJuly, "")}}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	r := f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Photos from 2022/X.json", sidecar("X", "XXX", tJuly, "")}}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if r.Promoted != 0 {
 		t.Fatalf("ambiguous title sidecar applied: %+v", r)
 	}
@@ -1778,13 +1778,13 @@ func TestLateTitleSidecarAmbiguousAcrossParts(t *testing.T) {
 func TestProvisionalSidecarOnlyFolderMovesWithMetadata(t *testing.T) {
 	f := newFixture(t)
 	a, b := randBytes(100), randBytes(110)
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Trip/metadata.json", []byte(`{"title": "Trip 2022", "access": "protected", "date": {"timestamp": "1663091246"}}`)},
 		{gp + "Trip/A.jpg", a},
 		{gp + "Trip/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{})
 	const export = "20261106T000000Z-1"
-	r := f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/B.jpg", b},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 		{gp + "Trip/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
@@ -1792,18 +1792,18 @@ func TestProvisionalSidecarOnlyFolderMovesWithMetadata(t *testing.T) {
 	if r.SidecarLinks != 1 {
 		t.Fatalf("provisional membership: %+v", r)
 	}
-	f.mustExist("leo/albums/Trip 2022/B.jpg")
-	r = f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+	f.mustExist("alice/albums/Trip 2022/B.jpg")
+	r = f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{
 		{gp + "Trip/metadata.json", []byte(`{"title": "Trip 2023", "access": "protected", "date": {"timestamp": "1694627246"}}`)},
 	}), Options{})
 	if r.Status != store.ArchiveIngested {
 		t.Fatalf("metadata part: %+v", r)
 	}
-	f.mustExist("leo/albums/Trip 2023/B.jpg", "leo/albums/Trip 2022/A.jpg")
-	if f.exists("leo/albums/Trip 2022/B.jpg") {
+	f.mustExist("alice/albums/Trip 2023/B.jpg", "alice/albums/Trip 2022/A.jpg")
+	if f.exists("alice/albums/Trip 2022/B.jpg") {
 		t.Error("provisional membership stayed in the album guessed by name")
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1813,21 +1813,21 @@ func TestProvisionalSidecarOnlyFolderMovesWithMetadata(t *testing.T) {
 func TestReconcileRecreatesMissingAlbumLinks(t *testing.T) {
 	f := newFixture(t)
 	a := randBytes(100)
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Trip/metadata.json", []byte(`{"title": "Trip 2022", "access": "protected", "date": {"timestamp": "1663091246"}}`)},
 		{gp + "Trip/A.jpg", a},
 		{gp + "Trip/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original")
 	albums, _ := f.st.ListAlbums(f.ctx, acct.ID)
 	if err := f.st.DeleteAlbumItem(f.ctx, albums[0].ID, it.ID); err != nil {
 		t.Fatal(err)
 	}
-	os.Remove(filepath.Join(f.cfg.DataDir, "leo/albums/Trip 2022/A.jpg"))
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-002.zip", []file{{gp + "Photos from 2022/Z.jpg", randBytes(90)}}), Options{})
-	f.mustExist("leo/albums/Trip 2022/A.jpg")
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	os.Remove(filepath.Join(f.cfg.DataDir, "alice/albums/Trip 2022/A.jpg"))
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-002.zip", []file{{gp + "Photos from 2022/Z.jpg", randBytes(90)}}), Options{})
+	f.mustExist("alice/albums/Trip 2022/A.jpg")
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1838,21 +1838,21 @@ func TestTitleAlbumEntryCollidingWithOtherFile(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261006T035113Z-1"
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /X.jpg", randBytes(70)},
 		{gp + "Trip /X.jpg.supplemental-metadata.json", sidecar("X.jpg", "AAA", tJuly, "")},
 		{gp + "Photos from 2022/B.jpg", randBytes(80)},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
-	r := f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{
 		{gp + "Trip /X.json", sidecar("X", "BBB", tJuly, "")}, // Google id of B, title X
 	}), Options{})
 	if r.SidecarLinks != 1 || r.Promoted != 0 {
 		t.Fatalf("colliding title entry: %+v", r)
 	}
-	f.mustExist("leo/albums/Trip to Austin/X.jpg", "leo/albums/Trip to Austin/B.jpg")
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	f.mustExist("alice/albums/Trip to Austin/X.jpg", "alice/albums/Trip to Austin/B.jpg")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if x, _ := f.st.FindItemByKey(f.ctx, acct.ID, "AAA#original"); x == nil {
 		t.Error("the unrelated file lost its identity")
 	}
@@ -1880,11 +1880,11 @@ func TestTitleSidecarNamingAnotherPhotoIsNotApplied(t *testing.T) {
 		if !late {
 			part1 = append(part1, sc)
 		}
-		f.ingest("leo", f.zip("takeout-"+export+"-001.zip", part1), Options{})
+		f.ingest("alice", f.zip("takeout-"+export+"-001.zip", part1), Options{})
 		if late {
-			f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{sc}), Options{})
+			f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{sc}), Options{})
 		}
-		acct, _ := f.st.GetAccount(f.ctx, "leo")
+		acct, _ := f.st.GetAccount(f.ctx, "alice")
 		bb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "BBB#original")
 		if bb == nil || !bytes.Equal(f.read(bb.LibPath), b) {
 			t.Fatalf("late=%v: B lost its bytes or identity: %+v", late, bb)
@@ -1892,11 +1892,11 @@ func TestTitleSidecarNamingAnotherPhotoIsNotApplied(t *testing.T) {
 		if fb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "occ:"+export+"#Trip #X.jpg"); fb == nil || !bytes.Equal(f.read(fb.LibPath), x) {
 			t.Errorf("late=%v: the nameless file was re-identified: %+v", late, fb)
 		}
-		f.mustExist("leo/albums/Trip to Austin/B.jpg", "leo/albums/Trip to Austin/X.jpg")
+		f.mustExist("alice/albums/Trip to Austin/B.jpg", "alice/albums/Trip to Austin/X.jpg")
 		if c, _ := f.st.Counts(f.ctx, acct.ID); c["items"] != 2 {
 			t.Errorf("late=%v: items %d", late, c["items"])
 		}
-		if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+		if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 			t.Errorf("late=%v: verify: %v %v", late, err, v.Problems)
 		}
 	}
@@ -1906,11 +1906,11 @@ func TestTitleSidecarNamingAnotherPhotoIsNotApplied(t *testing.T) {
 // title match: a later export with other bytes supersedes as usual.
 func TestExactSidecarOfUnlistedExtensionSupersedes(t *testing.T) {
 	f := newFixture(t)
-	f.ingest("leo", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.cr3", randBytes(70)},
 		{gp + "Photos from 2022/X.cr3.supplemental-metadata.json", sidecar("X.cr3", "RRR", tJuly, "")},
 	}), Options{})
-	r := f.ingest("leo", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-20261106T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.cr3", randBytes(72)},
 		{gp + "Photos from 2022/X.cr3.supplemental-metadata.json", sidecar("X.cr3", "RRR", tJuly, "")},
 	}), Options{})
@@ -1927,18 +1927,18 @@ func TestSettledAlbumSidecarNotReusedForOtherBytes(t *testing.T) {
 	const export = "20261006T035113Z-1"
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
 	b := randBytes(80)
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/B.jpg", b},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
-	f.mustExist("leo/albums/Trip to Austin/B.jpg")
-	r := f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Trip /B.jpg", randBytes(81)}}), Options{})
+	f.mustExist("alice/albums/Trip to Austin/B.jpg")
+	r := f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Trip /B.jpg", randBytes(81)}}), Options{})
 	if r.Added != 1 || r.Changed != 0 {
 		t.Fatalf("other bytes under the settled name: %+v", r)
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	bb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "BBB#original")
 	if bb == nil || !bytes.Equal(f.read(bb.LibPath), b) {
 		t.Fatalf("B's bytes replaced: %+v", bb)
@@ -1954,7 +1954,7 @@ func TestSettledAlbumSidecarNotReusedForOtherBytes(t *testing.T) {
 	if bb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "BBB#original"); !bytes.Equal(f.read(bb.LibPath), b) {
 		t.Error("B's bytes replaced at completion")
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -1966,19 +1966,19 @@ func TestSettledAlbumSidecarNotReusedForOtherBytes(t *testing.T) {
 func TestSettledSidecarReopenedForNewVersion(t *testing.T) {
 	f := newFixture(t)
 	b1, b2 := randBytes(80), randBytes(82)
-	f.ingest("leo", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
 		{gp + "Photos from 2022/B.jpg", b1},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
 	const export = "20261106T000000Z-1"
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
-	f.mustExist("leo/albums/Trip to Austin/B.jpg")
-	r := f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Trip /B.jpg", b2}}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	f.mustExist("alice/albums/Trip to Austin/B.jpg")
+	r := f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Trip /B.jpg", b2}}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	bb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "BBB#original")
 	if r.Added != 1 || r.Changed != 0 || !bytes.Equal(f.read(bb.LibPath), b1) {
 		t.Fatalf("decided before the export was complete: %+v", r)
@@ -1993,13 +1993,13 @@ func TestSettledSidecarReopenedForNewVersion(t *testing.T) {
 	if bb == nil || !bytes.Equal(f.read(bb.LibPath), b2) {
 		t.Error("new bytes not current")
 	}
-	if !bytes.Equal(f.read("leo/albums/Trip to Austin/B.jpg"), b2) {
+	if !bytes.Equal(f.read("alice/albums/Trip to Austin/B.jpg"), b2) {
 		t.Error("album link does not follow the new bytes")
 	}
 	if c, _ := f.st.Counts(f.ctx, acct.ID); c["items"] != 1 || c["pending_sidecars"] != 0 {
 		t.Errorf("items %d pending %d", c["items"], c["pending_sidecars"])
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -2011,16 +2011,16 @@ func TestTruncatedPrefixDeferralResolvesAtCompletion(t *testing.T) {
 	f := newFixture(t)
 	x1, x2 := randBytes(70), randBytes(72)
 	const name = "LongNameTruncatedByTakeout.jpg"
-	f.ingest("leo", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
 		{gp + "Photos from 2022/" + name, x1},
 		{gp + "Photos from 2022/" + name + ".supplemental-metadata.json", sidecar(name, "XXX", tJuly, "")},
 	}), Options{})
 	const export = "20261106T000000Z-1"
-	r := f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/" + name, x2},
 		{gp + "Photos from 2022/LongNameTruncatedByTak.json", sidecar("Some other title", "XXX", tJuly, "")},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "XXX#original")
 	if r.Changed != 0 || r.Added != 1 || !bytes.Equal(f.read(it.LibPath), x1) {
 		t.Fatalf("decided before the export was complete: %+v", r)
@@ -2038,7 +2038,7 @@ func TestTruncatedPrefixDeferralResolvesAtCompletion(t *testing.T) {
 	if c, _ := f.st.Counts(f.ctx, acct.ID); c["items"] != 1 || c["pending_sidecars"] != 0 {
 		t.Errorf("items %d pending %d", c["items"], c["pending_sidecars"])
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -2051,34 +2051,34 @@ func TestReplacedPartReopensConsumedSidecar(t *testing.T) {
 	const export = "20261006T035113Z-1"
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
 	b := randBytes(80)
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /B.json", sidecar("B", "BBB", tJuly, "")},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 1 {
 		t.Fatalf("pending: %d", n)
 	}
-	f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Trip /B.jpg", b}}), Options{})
-	f.mustExist("leo/albums/Trip to Austin/B.jpg")
+	f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Trip /B.jpg", b}}), Options{})
+	f.mustExist("alice/albums/Trip to Austin/B.jpg")
 	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 {
 		t.Fatalf("consumed sidecar still pending: %d", n)
 	}
-	r := f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Trip /C.jpg", randBytes(70)}}), Options{Replace: true})
+	r := f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Trip /C.jpg", randBytes(70)}}), Options{Replace: true})
 	if !r.Replaced {
 		t.Fatalf("replacement: %+v", r)
 	}
 	// the photo is still known: the album sidecar of part 1 makes the membership again
-	f.mustExist("leo/albums/Trip to Austin/B.jpg")
-	f.ingest("leo", f.zip("takeout-"+export+"-003.zip", []file{
+	f.mustExist("alice/albums/Trip to Austin/B.jpg")
+	f.ingest("alice", f.zip("takeout-"+export+"-003.zip", []file{
 		{gp + "Photos from 2022/B.jpg", b},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
-	f.mustExist("leo/albums/Trip to Austin/B.jpg", "leo/library/2022/07/B.jpg")
+	f.mustExist("alice/albums/Trip to Austin/B.jpg", "alice/library/2022/07/B.jpg")
 	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 {
 		t.Errorf("pending after resolution: %d", n)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -2091,12 +2091,12 @@ func TestResolvePendingLinksPhotosPromotedInTheSameCall(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261006T035113Z-1"
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", randBytes(70)},
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /Z.jpg", randBytes(60)},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	raw := sidecar("X", "XXX", tJuly, "")
 	for _, folder := range []string{"Photos from 2022", "Trip "} {
 		if err := f.st.PutPendingSidecar(f.ctx, acct.ID, export, 1, folder, "X", raw, "XXX"); err != nil {
@@ -2107,11 +2107,11 @@ func TestResolvePendingLinksPhotosPromotedInTheSameCall(t *testing.T) {
 	if err != nil || promoted != 1 || links != 1 {
 		t.Fatalf("one call: links %d promoted %d err %v", links, promoted, err)
 	}
-	f.mustExist("leo/albums/Trip to Austin/X.jpg")
+	f.mustExist("alice/albums/Trip to Austin/X.jpg")
 	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 {
 		t.Errorf("pending: %d", n)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -2121,8 +2121,8 @@ func TestResolvePendingLinksPhotosPromotedInTheSameCall(t *testing.T) {
 func TestExcludedFolderPendingRowsDropped(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261006T035113Z-1"
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{{gp + "Photos from 2022/A.jpg", randBytes(70)}}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{{gp + "Photos from 2022/A.jpg", randBytes(70)}}), Options{})
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if err := f.st.PutPendingSidecar(f.ctx, acct.ID, export, 1, "Trash", "T.jpg", sidecar("T.jpg", "TTT", tJuly, ""), "TTT"); err != nil {
 		t.Fatal(err)
 	}
@@ -2134,7 +2134,7 @@ func TestExcludedFolderPendingRowsDropped(t *testing.T) {
 	}
 	// a folder ingested while it was included keeps its rows
 	f.ing.cfg.Takeout.IncludeTrash = true
-	f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Trash/U.jpg", randBytes(71)}}), Options{})
+	f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{{gp + "Trash/U.jpg", randBytes(71)}}), Options{})
 	f.ing.cfg.Takeout.IncludeTrash = false
 	if err := f.st.PutPendingSidecar(f.ctx, acct.ID, export, 1, "Trash", "V.jpg", sidecar("V.jpg", "VVV", tJuly, ""), "VVV"); err != nil {
 		t.Fatal(err)
@@ -2153,17 +2153,17 @@ func TestYearFolderSidecarOfPhotoDeliveredInAlbumResolved(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261006T035113Z-1"
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
-	r := f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /X.jpg", randBytes(70)},
 		{gp + "Trip /X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, "")},
 		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, "")},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 || r.Added != 1 {
 		t.Errorf("pending %d: %+v", n, r)
 	}
-	f.mustExist("leo/albums/Trip to Austin/X.jpg")
+	f.mustExist("alice/albums/Trip to Austin/X.jpg")
 }
 
 // A stored sidecar whose source part is unknown (rows from before part
@@ -2172,13 +2172,13 @@ func TestYearFolderSidecarOfPhotoDeliveredInAlbumResolved(t *testing.T) {
 func TestUnknownPartPendingRowMakesNoMembership(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261006T035113Z-1"
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/A.jpg", randBytes(100)},
 		{gp + "Photos from 2022/A.jpg.supplemental-metadata.json", sidecar("A.jpg", "AAA", tJuly, "")},
 		{gp + "Trip /metadata.json", []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)},
 		{gp + "Trip /Z.jpg", randBytes(90)},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if err := f.st.PutPendingSidecar(f.ctx, acct.ID, export, 0, "Trip ", "A.jpg", sidecar("A.jpg", "AAA", tJuly, ""), "AAA"); err != nil {
 		t.Fatal(err)
 	}
@@ -2186,7 +2186,7 @@ func TestUnknownPartPendingRowMakesNoMembership(t *testing.T) {
 	if err != nil || links != 0 {
 		t.Fatalf("unknown-part row made a membership: %d %v", links, err)
 	}
-	if f.exists("leo/albums/Trip to Austin/A.jpg") {
+	if f.exists("alice/albums/Trip to Austin/A.jpg") {
 		t.Error("link made from a row of unknown part")
 	}
 }
@@ -2198,18 +2198,18 @@ func TestHeuristicMatchesGuardKnownPhotos(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261006T035113Z-1"
 	b := randBytes(80)
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/B.jpg", b},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
 	// an album folder with a file named B.jpg (other bytes) and a sidecar whose
 	// title is B.jpg but whose file name differs (matched by title only)
-	r := f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{
 		{gp + "Trip /metadata.json", []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)},
 		{gp + "Trip /B.jpg", randBytes(81)},
 		{gp + "Trip /B-other.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	bb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "BBB#original")
 	if bb == nil || !bytes.Equal(f.read(bb.LibPath), b) {
 		t.Fatalf("B's bytes replaced through a title match: %+v %+v", bb, r)
@@ -2217,7 +2217,7 @@ func TestHeuristicMatchesGuardKnownPhotos(t *testing.T) {
 	if fb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "occ:"+export+"#Trip #B.jpg"); fb == nil {
 		t.Error("the other file is not a fallback item")
 	}
-	f.mustExist("leo/albums/Trip to Austin/B.jpg") // B's membership from the kept sidecar
+	f.mustExist("alice/albums/Trip to Austin/B.jpg") // B's membership from the kept sidecar
 }
 
 // A sidecar-only membership of photo B survives an unrelated file named B.jpg
@@ -2229,7 +2229,7 @@ func TestSidecarOnlyMembershipAndSameNamedFileCoexist(t *testing.T) {
 	const export = "20261006T035113Z-1"
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
 	b, c := randBytes(80), randBytes(85)
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/B.jpg", b},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 		{gp + "Photos from 2022/C.jpg", c},
@@ -2239,17 +2239,17 @@ func TestSidecarOnlyMembershipAndSameNamedFileCoexist(t *testing.T) {
 		{gp + "Trip /C.jpg", randBytes(86)}, // another photo that happens to be named C.jpg
 		{gp + "Trip /C.jpg.supplemental-metadata.json", sidecar("C.jpg", "CC2", tJuly, "")},
 	}), Options{})
-	f.mustExist("leo/albums/Trip to Austin/B.jpg") // the other C.jpg links under a collision-suffixed name
+	f.mustExist("alice/albums/Trip to Austin/B.jpg") // the other C.jpg links under a collision-suffixed name
 	// an unrelated B.jpg lands in the album folder, and a sidecar naming C
 	// arrives although the folder already holds another photo of that name
-	r := f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{
 		{gp + "Trip /B.jpg", randBytes(81)},
 		{gp + "Trip /C.jpg.supplemental-metadata(1).json", sidecar("C.jpg", "CCC", tJuly, "")},
 	}), Options{})
 	if r.Status != store.ArchiveIngested {
 		t.Fatalf("part 2: %+v", r)
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	for _, key := range []string{"BBB#original", "CCC#original", "CC2#original"} {
 		it, _ := f.st.FindItemByKey(f.ctx, acct.ID, key)
 		if it == nil {
@@ -2269,7 +2269,7 @@ func TestSidecarOnlyMembershipAndSameNamedFileCoexist(t *testing.T) {
 	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 {
 		t.Errorf("pending: %d", n)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -2279,17 +2279,17 @@ func TestSidecarOnlyMembershipAndSameNamedFileCoexist(t *testing.T) {
 func TestTitleSidecarNewVersionSupersedes(t *testing.T) {
 	f := newFixture(t)
 	x1, x2 := randBytes(70), randBytes(72)
-	f.ingest("leo", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", x1},
 		{gp + "Photos from 2022/X.json", sidecar("X", "XXX", tJuly, "")},
 	}), Options{})
 	const export = "20261106T000000Z-1"
-	r := f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", x2},
 		{gp + "Photos from 2022/X.json", sidecar("X", "XXX", tJuly, "")},
 	}), Options{})
 	// undecided while the export may still deliver the photo elsewhere
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "XXX#original")
 	if r.Changed != 0 || r.Added != 1 || !bytes.Equal(f.read(it.LibPath), x1) {
 		t.Fatalf("decided before the export was complete: %+v", r)
@@ -2302,11 +2302,11 @@ func TestTitleSidecarNewVersionSupersedes(t *testing.T) {
 	if it == nil || !bytes.Equal(f.read(it.LibPath), x2) {
 		t.Error("new bytes not current")
 	}
-	f.mustExist("leo/library/2022/07/X~v" + sha8(x1) + ".jpg")
+	f.mustExist("alice/library/2022/07/X~v" + sha8(x1) + ".jpg")
 	if c, _ := f.st.Counts(f.ctx, acct.ID); c["items"] != 1 {
 		t.Errorf("items: %d", c["items"])
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -2317,16 +2317,16 @@ func TestTitleSidecarNewVersionSupersedes(t *testing.T) {
 func TestTitleEqualSidecarNewVersionWaitsForCompletion(t *testing.T) {
 	f := newFixture(t)
 	x1, x2 := randBytes(70), randBytes(72)
-	f.ingest("leo", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", x1},
 		{gp + "Photos from 2022/X.jpg.supplemental-metadata.json", sidecar("X.jpg", "XXX", tJuly, "")},
 	}), Options{})
 	const export = "20261106T000000Z-1"
-	r := f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", x2},
 		{gp + "Photos from 2022/X.jpg.supplemental-metadata(1).json", sidecar("X.jpg", "XXX", tJuly, "")},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	it, _ := f.st.FindItemByKey(f.ctx, acct.ID, "XXX#original")
 	if r.Changed != 0 || r.Added != 1 || !bytes.Equal(f.read(it.LibPath), x1) {
 		t.Fatalf("decided before the export was complete: %+v", r)
@@ -2347,7 +2347,7 @@ func TestTitleEqualSidecarNewVersionWaitsForCompletion(t *testing.T) {
 	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 0 {
 		t.Errorf("pending after resolution: %d", n)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -2358,13 +2358,13 @@ func TestExportComplete(t *testing.T) {
 	f := newFixture(t)
 	const export = "20261106T000000Z-1"
 	part := func(n int) {
-		f.ingest("leo", f.zip(fmt.Sprintf("takeout-%s-00%d.zip", export, n), []file{
+		f.ingest("alice", f.zip(fmt.Sprintf("takeout-%s-00%d.zip", export, n), []file{
 			{fmt.Sprintf("%sPhotos from 2022/P%d.jpg", gp, n), randBytes(50 + n)},
 		}), Options{})
 	}
 	part(1)
 	part(3)
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	far := time.Now().Add(30 * 24 * time.Hour)
 	check := func(want bool, quiet time.Duration, now time.Time, what string) {
 		t.Helper()
@@ -2394,19 +2394,19 @@ func TestExportComplete(t *testing.T) {
 func TestDeferredStemEntryRevalidated(t *testing.T) {
 	f := newFixture(t)
 	x1 := randBytes(70)
-	f.ingest("leo", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T035113Z-1-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", x1},
 		{gp + "Photos from 2022/X.json", sidecar("X", "XXX", tJuly, "")},
 	}), Options{})
 	const export = "20261106T000000Z-1"
-	f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/X.jpg", randBytes(72)},
 		{gp + "Photos from 2022/X.json", sidecar("X", "XXX", tJuly, "")},
 	}), Options{})
-	f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+	f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{
 		{gp + "Photos from 2022/X.png", randBytes(73)},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if _, promoted, err := f.ing.ResolvePending(f.ctx, acct, export, true); err != nil || promoted != 0 {
 		t.Fatalf("ambiguous deferred entry applied: %d %v", promoted, err)
 	}
@@ -2417,7 +2417,7 @@ func TestDeferredStemEntryRevalidated(t *testing.T) {
 	if n, _ := f.st.CountPendingSidecars(f.ctx, acct.ID); n != 1 {
 		t.Errorf("pending: %d", n)
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -2429,37 +2429,37 @@ func TestDeferredStemEntryRevalidated(t *testing.T) {
 func TestAlbumPartBeforePhotoPartDefersCollision(t *testing.T) {
 	f := newFixture(t)
 	b, x := randBytes(80), randBytes(70)
-	f.ingest("leo", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
+	f.ingest("alice", f.zip("takeout-20261006T000000Z-1-001.zip", []file{
 		{gp + "Photos from 2022/B.jpg", b},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
 	const export = "20261106T000000Z-1"
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
-	r := f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Trip /metadata.json", meta},
 		{gp + "Trip /X.jpg", x},
 		{gp + "Trip /X.json", sidecar("X", "BBB", tJuly, "")},
 	}), Options{})
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	bb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "BBB#original")
 	if r.Changed != 0 || !bytes.Equal(f.read(bb.LibPath), b) {
 		t.Fatalf("known photo superseded before the export was seen: %+v", r)
 	}
-	if f.exists("leo/albums/Trip to Austin/B.jpg") {
+	if f.exists("alice/albums/Trip to Austin/B.jpg") {
 		t.Fatal("membership made before the photo was seen in this export")
 	}
-	r = f.ingest("leo", f.zip("takeout-"+export+"-002.zip", []file{
+	r = f.ingest("alice", f.zip("takeout-"+export+"-002.zip", []file{
 		{gp + "Photos from 2022/B.jpg", b},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 	}), Options{})
 	if r.SidecarLinks != 1 {
 		t.Fatalf("membership after the photo arrived elsewhere: %+v", r)
 	}
-	f.mustExist("leo/albums/Trip to Austin/B.jpg", "leo/albums/Trip to Austin/X.jpg")
+	f.mustExist("alice/albums/Trip to Austin/B.jpg", "alice/albums/Trip to Austin/X.jpg")
 	if fb, _ := f.st.FindItemByKey(f.ctx, acct.ID, "occ:"+export+"#Trip #X.jpg"); fb == nil || !bytes.Equal(f.read(fb.LibPath), x) {
 		t.Error("the unrelated file was re-identified")
 	}
-	if v, err := f.ing.Verify(f.ctx, "leo", true); err != nil || len(v.Problems) > 0 {
+	if v, err := f.ing.Verify(f.ctx, "alice", true); err != nil || len(v.Problems) > 0 {
 		t.Errorf("verify: %v %v", err, v.Problems)
 	}
 }
@@ -2472,7 +2472,7 @@ func TestTitleEntryWithUnrelatedPairMakesNoVariant(t *testing.T) {
 	const export = "20261006T035113Z-1"
 	meta := []byte(`{"title": "Trip to Austin", "access": "protected", "date": {"timestamp": "1663091246"}}`)
 	b := randBytes(80)
-	r := f.ingest("leo", f.zip("takeout-"+export+"-001.zip", []file{
+	r := f.ingest("alice", f.zip("takeout-"+export+"-001.zip", []file{
 		{gp + "Photos from 2022/B.jpg", b},
 		{gp + "Photos from 2022/B.jpg.supplemental-metadata.json", sidecar("B.jpg", "BBB", tJuly, "")},
 		{gp + "Trip /metadata.json", meta},
@@ -2483,7 +2483,7 @@ func TestTitleEntryWithUnrelatedPairMakesNoVariant(t *testing.T) {
 	if r.SidecarLinks != 1 {
 		t.Fatalf("named photo not linked: %+v", r)
 	}
-	acct, _ := f.st.GetAccount(f.ctx, "leo")
+	acct, _ := f.st.GetAccount(f.ctx, "alice")
 	if v, _ := f.st.FindItemByKey(f.ctx, acct.ID, "BBB#motion"); v != nil {
 		t.Error("the unrelated video became the photo's motion variant")
 	}
@@ -2492,5 +2492,5 @@ func TestTitleEntryWithUnrelatedPairMakesNoVariant(t *testing.T) {
 			t.Errorf("%s is not a fallback item", name)
 		}
 	}
-	f.mustExist("leo/albums/Trip to Austin/B.jpg")
+	f.mustExist("alice/albums/Trip to Austin/B.jpg")
 }

@@ -57,12 +57,12 @@ func TestLibrarySummaryAfterChange(t *testing.T) {
 			rc := &fakeRemote{listings: map[string][]rclone.RemoteFile{}, files: map[string]string{}}
 			r, _ := newRunner(t, rc)
 			r.Cfg.Layout.LinkMode = tc.mode
-			r.Cfg.Accounts["ira"] = config.Account{RcloneRemote: "gdrive2:Takeout"}
+			r.Cfg.Accounts["bob"] = config.Account{RcloneRemote: "gdrive2:Takeout"}
 			now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
 			r.Now = func() time.Time { return now }
 			ctx := context.Background()
 
-			rep := r.Run(ctx, []string{"leo"}, false)
+			rep := r.Run(ctx, []string{"alice"}, false)
 			if rep.changed() || rep.Library != nil || strings.Contains(rep.HTML(), "Library") {
 				t.Fatalf("idle run reported a change:\n%s", rep.Text())
 			}
@@ -85,33 +85,33 @@ func TestLibrarySummaryAfterChange(t *testing.T) {
 			rc.listings["gdrive:Takeout"] = []rclone.RemoteFile{{ID: "f1", Name: filepath.Base(zipPath), Size: fi.Size(), ModTime: now.Add(-30 * 24 * time.Hour)}}
 			rc.files["f1"] = zipPath
 
-			rep = r.Run(ctx, []string{"leo"}, false)
+			rep = r.Run(ctx, []string{"alice"}, false)
 			if rep.Exit != ExitOK {
 				t.Fatalf("exit %d:\n%s", rep.Exit, rep.Text())
 			}
 			if !rep.Accounts[0].Changed || len(rep.Library) != 2 || rep.LibraryTotal == nil {
 				t.Fatalf("changed %v, library %+v, total %+v:\n%s", rep.Accounts[0].Changed, rep.Library, rep.LibraryTotal, rep.Text())
 			}
-			leo := Library{Name: "leo", Photos: 1, Videos: 1, Albums: 1, Links: 1, Bytes: tc.bytes}
-			total := leo
+			alice := Library{Name: "alice", Photos: 1, Videos: 1, Albums: 1, Links: 1, Bytes: tc.bytes}
+			total := alice
 			total.Name = "all accounts"
 			// configured accounts are listed by name
-			if got := *rep.Library[0]; got != (Library{Name: "ira"}) {
-				t.Errorf("ira: got %+v, want an empty library", got)
+			if got := *rep.Library[0]; got != alice {
+				t.Errorf("alice: got %+v, want %+v", got, alice)
 			}
-			if got := *rep.Library[1]; got != leo {
-				t.Errorf("leo: got %+v, want %+v", got, leo)
+			if got := *rep.Library[1]; got != (Library{Name: "bob"}) {
+				t.Errorf("bob: got %+v, want an empty library", got)
 			}
 			if got := *rep.LibraryTotal; got != total {
 				t.Errorf("total: got %+v, want %+v", got, total)
 			}
-			want := fmt.Sprintf("\nLibrary\nira: 0 photos, 0 videos, 0 albums, 0 KB on disk\nleo: 1 photo, 1 video, 1 album, %d KB on disk\nall accounts: 1 photo, 1 video, 1 album, %d KB on disk\n", tc.bytes/1024, tc.bytes/1024)
+			want := fmt.Sprintf("\nLibrary\nalice: 1 photo, 1 video, 1 album, %d KB on disk\nbob: 0 photos, 0 videos, 0 albums, 0 KB on disk\nall accounts: 1 photo, 1 video, 1 album, %d KB on disk\n", tc.bytes/1024, tc.bytes/1024)
 			if text := rep.Text(); !strings.Contains(text, want) {
 				t.Errorf("summary missing, want %q in:\n%s", want, text)
 			}
 
 			// nothing new on Drive: the part is skipped and the summary stays out
-			rep = r.Run(ctx, []string{"leo"}, false)
+			rep = r.Run(ctx, []string{"alice"}, false)
 			if rep.Exit != ExitOK || rep.changed() || rep.Library != nil {
 				t.Fatalf("unchanged run: exit %d, changed %v, library %+v:\n%s", rep.Exit, rep.changed(), rep.Library, rep.Text())
 			}
@@ -124,18 +124,18 @@ func TestLibrarySummaryAfterChange(t *testing.T) {
 func TestLibrarySummaryRendering(t *testing.T) {
 	rep := &Report{
 		Finished: time.Date(2026, 10, 10, 1, 12, 0, 0, time.UTC),
-		Accounts: []*AccountReport{{Name: "leo", Changed: true}},
+		Accounts: []*AccountReport{{Name: "alice", Changed: true}},
 		Library: []*Library{
-			{Name: "leo", Photos: 40123, Videos: 3468, Albums: 127, Links: 18995, Bytes: 122_100_000_000},
-			{Name: "ira & co", Photos: 1, Videos: 0, Albums: 2, Bytes: 500_000},
+			{Name: "alice", Photos: 40123, Videos: 3468, Albums: 127, Links: 18995, Bytes: 122_100_000_000},
+			{Name: "bob & co", Photos: 1, Videos: 0, Albums: 2, Bytes: 500_000},
 		},
 		LibraryTotal: &Library{Name: "all accounts", Photos: 40124, Videos: 3468, Albums: 129, Links: 18995, Bytes: 122_100_400_000},
 	}
 	html := rep.HTML()
 	for _, want := range []string{
 		"\n<b>Library</b>\n",
-		"leo: 40,123 photos, 3,468 videos, 127 albums, 122.1 GB on disk\n",
-		"ira &amp; co: 1 photo, 0 videos, 2 albums, 500 KB on disk\n",
+		"alice: 40,123 photos, 3,468 videos, 127 albums, 122.1 GB on disk\n",
+		"bob &amp; co: 1 photo, 0 videos, 2 albums, 500 KB on disk\n",
 		"<b>all accounts</b>: 40,124 photos, 3,468 videos, 129 albums, 122.1 GB on disk\n",
 	} {
 		if !strings.Contains(html, want) {

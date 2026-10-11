@@ -21,7 +21,7 @@ func TestExportTrackingBackfill(t *testing.T) {
 		t.Fatal(err)
 	}
 	stmts := []string{
-		`INSERT INTO accounts(id, name, rclone_remote, created_at) VALUES (1, 'leo', 'r:', 'x')`,
+		`INSERT INTO accounts(id, name, rclone_remote, created_at) VALUES (1, 'alice', 'r:', 'x')`,
 		`INSERT INTO blobs(id, sha256, size, canonical_path, first_seen) VALUES (1, 'S', 1, 'p1', 'x'), (2, 'T', 1, 'p2', 'x')`,
 		`INSERT INTO items(id, account_id, blob_id, variant, identity_key, identity_src, filename, ext, lib_path, group_id, first_seen, last_seen)
 		   VALUES (1, 1, 1, 'original', 'k1', 'google_id', 'a.jpg', '.jpg', 'p1', 'g1', 'x', 'x'),

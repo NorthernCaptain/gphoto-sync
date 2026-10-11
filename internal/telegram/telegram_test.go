@@ -85,9 +85,9 @@ func TestPairAndDrain(t *testing.T) {
 		code := <-codeCh
 		api.mu.Lock()
 		api.updates = append(api.updates,
-			Update{UpdateID: 10, Message: &Message{Chat: Chat{ID: 5, Type: "private"}, From: &User{ID: 7, Username: "leo"}, Text: "/start WRONG"}},
+			Update{UpdateID: 10, Message: &Message{Chat: Chat{ID: 5, Type: "private"}, From: &User{ID: 7, Username: "alice"}, Text: "/start WRONG"}},
 			Update{UpdateID: 11, Message: &Message{Chat: Chat{ID: 6, Type: "group"}, Text: "/start " + code}},
-			Update{UpdateID: 12, Message: &Message{Chat: Chat{ID: 5, Type: "private"}, From: &User{ID: 7, Username: "leo", FirstName: "Leo"}, Text: "/start " + code}},
+			Update{UpdateID: 12, Message: &Message{Chat: Chat{ID: 5, Type: "private"}, From: &User{ID: 7, Username: "alice", FirstName: "Alice"}, Text: "/start " + code}},
 		)
 		api.mu.Unlock()
 	}()

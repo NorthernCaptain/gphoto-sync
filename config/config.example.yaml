@@ -10,8 +10,8 @@ rclone:
   extra_args: ["--multi-thread-streams", "4", "--retries", "5", "--low-level-retries", "20"]
 
 accounts:                  # key = e-mail local part = folder name under data_dir
-  leo:
-    rclone_remote: "gdrive-leo:Takeout"
+  alice:
+    rclone_remote: "gdrive-alice:Takeout"
   # jane:
   #   rclone_remote: "gdrive-jane:Takeout"
   #   takeout: { settle: 4h }

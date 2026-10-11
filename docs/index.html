@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gphoto-sync</title>
+  <meta name="description" content="gphoto-sync keeps a self-hosted copy of your Google Photos library, built from Google Takeout exports delivered to Google Drive.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <header class="site">
+      <a class="brand" href="index.html">gphoto-sync</a>
+      <nav>
+        <a href="https://github.com/NorthernCaptain/gphoto-sync">GitHub</a>
+      </nav>
+    </header>
+
+    <h1>Your Google Photos, on your own disk.</h1>
+    <p class="lead">gphoto-sync is a small open-source tool that keeps a complete, browsable copy of one or more Google Photos libraries on a Linux machine you control.</p>
+
+    <a class="cta" href="https://github.com/NorthernCaptain/gphoto-sync">View the project on GitHub</a>
+
+    <h2>How it works</h2>
+    <p>Google Takeout can export your photo library on a schedule and deliver the archives to your Google Drive. gphoto-sync runs once a week on your server, fetches any new archive from your Drive with <a href="https://rclone.org/">rclone</a>, unpacks it, and files every photo and video into a plain folder tree:</p>
+<pre>&lt;data&gt;/
+  &lt;account&gt;/
+    library/YYYY/MM/&lt;original filename&gt;   every item once, its Takeout metadata next to it
+    albums/&lt;album title&gt;/&lt;filename&gt;       albums as folders, hardlinked into library/</pre>
+    <p>Originals are never modified. Edited versions, motion-photo clips and album membership are preserved. A small SQLite database remembers what was ingested, so repeated exports only add what is new, and a Telegram message reports the outcome of every run.</p>
+
+    <h2>What it needs from Google</h2>
+    <p>The tool reads the Takeout archives from your own Google Drive using an OAuth client you create in your own Google Cloud project. The permission you grant is access to your Google Drive; the tool uses it only to list, download and, if you choose, delete the Takeout archives. The archives are downloaded to your server for unpacking (and removed afterwards unless you choose to keep them); the extracted library and the access token stay there. Nothing else leaves it, apart from the optional run report you can have sent to your own Telegram chat. See the <a href="privacy.html">privacy policy</a> for details.</p>
+
+    <h2>Who it is for</h2>
+    <p>People who like Google Photos but also want a copy of their pictures that is theirs: readable with any file browser, backed up with any tool, independent of any account. The project is written in Go, ships as a Docker image, is released under the <a href="https://github.com/NorthernCaptain/gphoto-sync/blob/main/LICENSE">MIT License</a> and is maintained by Northern Captain.</p>
+
+    <p class="meta">Source, issues and documentation: <a href="https://github.com/NorthernCaptain/gphoto-sync">github.com/NorthernCaptain/gphoto-sync</a></p>
+  </main>
+  <footer>
+    <span>© 2026 Northern Captain</span>
+    <a href="privacy.html">Privacy Policy</a>
+    <a href="terms.html">Terms of Service</a>
+    <a href="https://github.com/NorthernCaptain/gphoto-sync">GitHub</a>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy Policy · gphoto-sync</title>
+  <meta name="description" content="How gphoto-sync handles your data and your Google account access.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <header class="site">
+      <a class="brand" href="index.html">gphoto-sync</a>
+      <nav>
+        <a href="terms.html">Terms</a>
+        <a href="https://github.com/NorthernCaptain/gphoto-sync">GitHub</a>
+      </nav>
+    </header>
+
+    <h1>Privacy Policy</h1>
+    <p class="meta">Effective October 10, 2026</p>
+
+    <p>gphoto-sync is open-source software (MIT License) that you install and run on your own computer. Northern Captain publishes the software but does not operate it for you: there is no hosted service, no account with us, and no server of ours that your data passes through. This policy explains what the software does with your data when you run it, and what this website collects.</p>
+
+    <h2>What the software accesses</h2>
+    <p>When you connect a Google account, gphoto-sync asks for access to Google Drive through Google's OAuth consent flow, using an OAuth client that belongs to your own Google Cloud project. The permission requested is full access to your Google Drive (the <code>drive</code> scope): Google offers no narrower permission that lets a tool download files created by Takeout and delete them afterwards. What the software does with that permission is limited to the following:</p>
+    <ul>
+      <li>lists the folder in your Drive where Google Takeout places its export archives;</li>
+      <li>downloads those archive files to your computer;</li>
+      <li>when you enable the option, moves and deletes an archive from your Drive after it has been safely stored locally.</li>
+    </ul>
+    <p>It does not read, change or share any other file in your Drive, and it does not use the Google Photos API. You can see exactly what it does in the source code, and you can withdraw the permission at any time (see below).</p>
+
+    <h2>Where your data goes</h2>
+    <ul>
+      <li><strong>Your photos and videos</strong> are extracted from the archives into a folder tree on a disk you choose, on your own machine.</li>
+      <li><strong>Metadata</strong> exported by Takeout (dates, descriptions, album names, location data if you include it) is stored next to the files and in a local SQLite database on the same machine.</li>
+      <li><strong>The OAuth token</strong> that grants Drive access is stored in rclone's configuration file on your machine, readable only by the user that runs the software.</li>
+      <li><strong>Reports</strong> about each run are the one optional exception. If you create a Telegram bot and pair a chat with it, the software sends a short report after each run (archive and file names, counts, error messages; never the photos or videos themselves) through Telegram's servers to the chats you paired. Nothing is sent if you do not configure a bot.</li>
+    </ul>
+    <p>None of this is transmitted to Northern Captain, and apart from the optional Telegram reports nothing is transmitted to any third party. The software has no analytics, telemetry or crash reporting.</p>
+
+    <h2>What we collect</h2>
+    <p>Nothing. We do not receive, store or have access to your photos, your metadata, your Google account or your access tokens. This website is a set of static pages: it sets no cookies and runs no tracking scripts. It is hosted on GitHub Pages, whose own privacy practices are described in <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub's privacy statement</a>.</p>
+
+    <h2>Google user data</h2>
+    <p>gphoto-sync's use of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements. Google user data is used only to provide the backup function described above, is never sold and never used for advertising. It is stored on the machine you run the software on and is not shared with anyone, except for the information contained in the optional run reports (file names and counts, never the media) that you can choose to have sent to your own Telegram chats.</p>
+
+    <h2>Revoking access</h2>
+    <p>You can withdraw the software's access to your Google account at any time at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>, by removing the application there. Deleting the remote's section from your rclone configuration file removes the stored token from your machine. Your local copy of the library is yours to keep or delete.</p>
+
+    <h2>Children</h2>
+    <p>The software and this website are not directed at children under 13 and do not knowingly collect information from them.</p>
+
+    <h2>Changes</h2>
+    <p>If this policy changes, the new version will be published on this page with an updated effective date. The history of changes is visible in the project's <a href="https://github.com/NorthernCaptain/gphoto-sync">public repository</a>.</p>
+
+    <h2>Contact</h2>
+    <p>Questions about this policy can be raised by opening an issue at <a href="https://github.com/NorthernCaptain/gphoto-sync/issues">github.com/NorthernCaptain/gphoto-sync/issues</a>.</p>
+  </main>
+  <footer>
+    <span>© 2026 Northern Captain</span>
+    <a href="privacy.html">Privacy Policy</a>
+    <a href="terms.html">Terms of Service</a>
+    <a href="https://github.com/NorthernCaptain/gphoto-sync">GitHub</a>
+  </footer>
+</body>
+</html>

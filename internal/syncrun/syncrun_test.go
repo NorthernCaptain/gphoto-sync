@@ -59,7 +59,7 @@ func newRunner(t *testing.T, rc Remote) (*Runner, *store.Store) {
 	st := store.New(d)
 	cfg := config.Default()
 	cfg.DataDir, cfg.StateDir, cfg.Takeout.InboxDir = filepath.Join(root, "data"), root, filepath.Join(root, "inbox")
-	cfg.Accounts = map[string]config.Account{"leo": {RcloneRemote: "gdrive:Takeout"}}
+	cfg.Accounts = map[string]config.Account{"alice": {RcloneRemote: "gdrive:Takeout"}}
 	os.MkdirAll(cfg.DataDir, 0o755)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return &Runner{Cfg: cfg, St: st, Log: log, Ing: ingest.New(cfg, st, log), RC: rc}, st
@@ -79,7 +79,7 @@ func TestResumeSettlesStagedCopyFirst(t *testing.T) {
 	}}
 	r, st := newRunner(t, rc)
 	r.Now = func() time.Time { return old.Add(48 * time.Hour) }
-	acct, _ := st.EnsureAccount(ctx, "leo", "gdrive:Takeout")
+	acct, _ := st.EnsureAccount(ctx, "alice", "gdrive:Takeout")
 	a, err := st.UpsertArchive(ctx, &store.Archive{AccountID: acct.ID, RemoteID: "A", Name: name, ExportID: "20261006T035113Z-1", PartNo: 1, Size: 5, MD5: "aa", Status: store.ArchiveIngested})
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +89,7 @@ func TestResumeSettlesStagedCopyFirst(t *testing.T) {
 	if err := st.FinishArchive(ctx, a.ID, store.ArchivePartial, 10, 9, 0, 1); err != nil {
 		t.Fatal(err)
 	}
-	ar := r.runAccount(ctx, "leo", false)
+	ar := r.runAccount(ctx, "alice", false)
 	if len(rc.deleted) != 1 || rc.deleted[0] != "gdrive:Takeout/"+trashFolder+"/"+name+".A" {
 		t.Fatalf("staged copy not deleted before adopting the new file: deleted %v, report %+v", rc.deleted, ar)
 	}
@@ -111,7 +111,7 @@ func TestFinishStagedDeletes(t *testing.T) {
 		}}
 		r, st := newRunner(t, rc)
 		r.Cfg.Takeout.DeleteRemoteAfterIngest = deleteOn
-		acct, _ := st.EnsureAccount(ctx, "leo", "gdrive:Takeout")
+		acct, _ := st.EnsureAccount(ctx, "alice", "gdrive:Takeout")
 		a, err := st.UpsertArchive(ctx, &store.Archive{AccountID: acct.ID, RemoteID: "x", Name: "p", ExportID: "e-1", PartNo: 1, Size: 5, MD5: "aa", Status: store.ArchiveIngested})
 		if err != nil {
 			t.Fatal(err)
@@ -127,7 +127,7 @@ func TestFinishStagedDeletes(t *testing.T) {
 		if _, err := st.UpsertArchive(ctx, &store.Archive{AccountID: acct.ID, RemoteID: "y", Name: "q", ExportID: "e-1", PartNo: 2, Size: 5, MD5: "bb", Status: store.ArchiveWithErrors}); err != nil {
 			t.Fatal(err)
 		}
-		ar := &AccountReport{Name: "leo"}
+		ar := &AccountReport{Name: "alice"}
 		r.finishStagedDeletes(ctx, ar, acct.ID, "gdrive:Takeout", nil)
 		if len(rc.deleted) != 1 || rc.deleted[0] != "gdrive:Takeout/"+trashFolder+"/p.x" {
 			t.Fatalf("delete_remote_after_ingest=%v: deleted %v", deleteOn, rc.deleted)
@@ -150,12 +150,12 @@ func TestFinishStagedDeletesVerifies(t *testing.T) {
 	}}
 	r, st := newRunner(t, rc)
 	r.Cfg.Takeout.DeleteRemoteAfterIngest = true
-	acct, _ := st.EnsureAccount(ctx, "leo", "gdrive:Takeout")
+	acct, _ := st.EnsureAccount(ctx, "alice", "gdrive:Takeout")
 	a, _ := st.UpsertArchive(ctx, &store.Archive{AccountID: acct.ID, RemoteID: "x", Name: "p", ExportID: "e-1", PartNo: 1, Size: 5, MD5: "aa", Status: store.ArchiveIngested})
 	_ = st.SetArchiveStaged(ctx, a.ID)
 	b, _ := st.UpsertArchive(ctx, &store.Archive{AccountID: acct.ID, RemoteID: "gone", Name: "r", ExportID: "e-1", PartNo: 3, Size: 5, MD5: "cc", Status: store.ArchiveIngested})
 	_ = st.SetArchiveStaged(ctx, b.ID)
-	ar := &AccountReport{Name: "leo"}
+	ar := &AccountReport{Name: "alice"}
 	r.finishStagedDeletes(ctx, ar, acct.ID, "gdrive:Takeout", nil)
 	if len(rc.deleted) != 0 {
 		t.Fatalf("mismatching staged file deleted: %v", rc.deleted)

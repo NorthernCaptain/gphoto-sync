@@ -18,7 +18,7 @@ func TestUpsertArchiveClearsDeletionOnNewRemote(t *testing.T) {
 	}
 	defer d.Close()
 	st := New(d)
-	acct, err := st.EnsureAccount(ctx, "leo", "r:")
+	acct, err := st.EnsureAccount(ctx, "alice", "r:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestStagedArchivesListedRegardlessOfStatus(t *testing.T) {
 	}
 	defer d.Close()
 	st := New(d)
-	acct, _ := st.EnsureAccount(ctx, "leo", "r:")
+	acct, _ := st.EnsureAccount(ctx, "alice", "r:")
 	a, err := st.UpsertArchive(ctx, &Archive{AccountID: acct.ID, RemoteID: "x", Name: "p", ExportID: "e-1", PartNo: 1, MD5: "aa", Status: ArchiveIngested})
 	if err != nil {
 		t.Fatal(err)
@@ -101,18 +101,18 @@ func TestArchiveLookupIsPerAccount(t *testing.T) {
 	}
 	defer d.Close()
 	st := New(d)
-	leo, _ := st.EnsureAccount(ctx, "leo", "r:")
+	alice, _ := st.EnsureAccount(ctx, "alice", "r:")
 	jane, _ := st.EnsureAccount(ctx, "jane", "r:")
-	if _, err := st.UpsertArchive(ctx, &Archive{AccountID: leo.ID, RemoteID: "x", Name: "p", ExportID: "e-1", PartNo: 1, Status: ArchiveIngested}); err != nil {
+	if _, err := st.UpsertArchive(ctx, &Archive{AccountID: alice.ID, RemoteID: "x", Name: "p", ExportID: "e-1", PartNo: 1, Status: ArchiveIngested}); err != nil {
 		t.Fatal(err)
 	}
 	if a, _ := st.GetArchiveByRemoteID(ctx, jane.ID, "x"); a != nil {
 		t.Error("another account's archive returned for jane")
 	}
-	if a, _ := st.GetArchiveByRemoteID(ctx, leo.ID, "x"); a == nil {
-		t.Error("leo's own archive not found")
+	if a, _ := st.GetArchiveByRemoteID(ctx, alice.ID, "x"); a == nil {
+		t.Error("alice's own archive not found")
 	}
-	if a, _ := st.ArchiveByRemoteIDAnyAccount(ctx, "x"); a == nil || a.AccountID != leo.ID {
+	if a, _ := st.ArchiveByRemoteIDAnyAccount(ctx, "x"); a == nil || a.AccountID != alice.ID {
 		t.Errorf("owner lookup: %+v", a)
 	}
 }
@@ -127,25 +127,25 @@ func TestRenameLinkPrefixNonASCII(t *testing.T) {
 	}
 	defer d.Close()
 	st := New(d)
-	acct, _ := st.EnsureAccount(ctx, "leo", "r:")
-	b, _ := st.InsertBlob(ctx, "s", 1, "leo/library/2016/04/a.jpg")
-	itemID, err := st.InsertItem(ctx, &Item{AccountID: acct.ID, BlobID: b.ID, Variant: "original", IdentityKey: "k", IdentitySrc: IdentityGoogle, Filename: "a.jpg", Ext: ".jpg", LibPath: "leo/library/2016/04/a.jpg", GroupID: "k"})
+	acct, _ := st.EnsureAccount(ctx, "alice", "r:")
+	b, _ := st.InsertBlob(ctx, "s", 1, "alice/library/2016/04/a.jpg")
+	itemID, err := st.InsertItem(ctx, &Item{AccountID: acct.ID, BlobID: b.ID, Variant: "original", IdentityKey: "k", IdentitySrc: IdentityGoogle, Filename: "a.jpg", Ext: ".jpg", LibPath: "alice/library/2016/04/a.jpg", GroupID: "k"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	albumID, err := st.InsertAlbum(ctx, &Album{AccountID: acct.ID, Title: "Spotlight on Андрейка", TakeoutFolder: "Spotlight on Андрейка(1)", Path: "leo/albums/Spotlight on Андрейка(1)", Kind: "own"}, nil)
+	albumID, err := st.InsertAlbum(ctx, &Album{AccountID: acct.ID, Title: "Spotlight on Андрейка", TakeoutFolder: "Spotlight on Андрейка(1)", Path: "alice/albums/Spotlight on Андрейка(1)", Kind: "own"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := "leo/albums/Spotlight on Андрейка(1)/a.jpg"
+	old := "alice/albums/Spotlight on Андрейка(1)/a.jpg"
 	if err := st.UpsertAlbumItem(ctx, &AlbumItem{AlbumID: albumID, ItemID: itemID, LinkPath: old, Direct: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.RenameLinkPrefix(ctx, albumID, "leo/albums/Spotlight on Андрейка(1)/", "leo/albums/Spotlight on Андрейка~6acaacac/"); err != nil {
+	if err := st.RenameLinkPrefix(ctx, albumID, "alice/albums/Spotlight on Андрейка(1)/", "alice/albums/Spotlight on Андрейка~6acaacac/"); err != nil {
 		t.Fatal(err)
 	}
 	ai, _ := st.GetAlbumItem(ctx, albumID, itemID)
-	if ai == nil || ai.LinkPath != "leo/albums/Spotlight on Андрейка~6acaacac/a.jpg" {
+	if ai == nil || ai.LinkPath != "alice/albums/Spotlight on Андрейка~6acaacac/a.jpg" {
 		t.Fatalf("link path after rename: %+v", ai)
 	}
 }
@@ -162,7 +162,7 @@ func TestPendingUpsertResetsStateOnChange(t *testing.T) {
 	}
 	defer d.Close()
 	st := New(d)
-	acct, _ := st.EnsureAccount(ctx, "leo", "r:")
+	acct, _ := st.EnsureAccount(ctx, "alice", "r:")
 	raw1, raw2 := []byte(`{"title":"a"}`), []byte(`{"title":"b"}`)
 	put := func(part int, raw []byte) {
 		t.Helper()
@@ -216,9 +216,9 @@ func TestPendingFoundOnlyByNamedPhoto(t *testing.T) {
 	}
 	defer d.Close()
 	st := New(d)
-	acct, _ := st.EnsureAccount(ctx, "leo", "r:")
-	b, _ := st.InsertBlob(ctx, "s", 1, "leo/library/2016/04/c.jpg")
-	other, _ := st.InsertItem(ctx, &Item{AccountID: acct.ID, BlobID: b.ID, GoogleID: "CC2", Variant: "original", IdentityKey: "CC2#original", IdentitySrc: IdentityGoogle, Filename: "c.jpg", Ext: ".jpg", LibPath: "leo/library/2016/04/c.jpg", GroupID: "CC2#original"})
+	acct, _ := st.EnsureAccount(ctx, "alice", "r:")
+	b, _ := st.InsertBlob(ctx, "s", 1, "alice/library/2016/04/c.jpg")
+	other, _ := st.InsertItem(ctx, &Item{AccountID: acct.ID, BlobID: b.ID, GoogleID: "CC2", Variant: "original", IdentityKey: "CC2#original", IdentitySrc: IdentityGoogle, Filename: "c.jpg", Ext: ".jpg", LibPath: "alice/library/2016/04/c.jpg", GroupID: "CC2#original"})
 	if _, err := st.UpsertOccurrence(ctx, &Occurrence{AccountID: acct.ID, ExportID: "e-1", PartNo: 1, Folder: "Trip", EntryName: "c.jpg", Variant: "original", SHA256: "s", ItemID: other, State: OccResolved}); err != nil {
 		t.Fatal(err)
 	}
